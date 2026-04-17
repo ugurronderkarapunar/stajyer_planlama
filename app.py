@@ -187,14 +187,13 @@ elif menu == "📅 İZİN SİSTEMİ":
             iz_df = get_intern_leaves(s_id)
             
             if not iz_df.empty:
-                # İzin Düzenleme Editörü (id sütununu gizliyoruz, sadece tarih ve tip düzenlenebilir)
+                # İzin Düzenleme Editörü
                 edited_iz_df = st.data_editor(iz_df[['izin_tarihi', 'izin_tipi']], num_rows="dynamic", key="izin_editor", hide_index=True, use_container_width=True)
                 
                 if st.button("🔄 İZİNLERİ GÜNCELLE"):
-                    # Seçili stajyerin tüm izinlerini silip editördeki son haliyle tekrar ekliyoruz
                     conn.execute(f"DELETE FROM izinler WHERE stajyer_id = {s_id}")
                     for _, row in edited_iz_df.iterrows():
-                        if pd.notna(row['izin_tarihi']): # Boş satırları filtrele
+                        if pd.notna(row['izin_tarihi']):
                             conn.execute("INSERT INTO izinler (stajyer_id, izin_tarihi, izin_tipi) VALUES (?,?,?)", (int(s_id), row['izin_tarihi'], row['izin_tipi']))
                     conn.commit()
                     st.success("İZİN KAYITLARI GÜNCELLENDİ!"); st.rerun()
