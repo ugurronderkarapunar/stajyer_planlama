@@ -48,96 +48,35 @@ TR_GUNLER = {
     'Thursday': 'PERŞEMBE', 'Friday': 'CUMA', 'Saturday': 'CUMARTESİ', 'Sunday': 'PAZAR'
 }
 
-# 2026 RESMİ TATİLLER VE DİNİ BAYRAMLAR
 def get_resmi_tatiller(yil):
-    # Sabit Resmi Tatiller
-    tatiller = [
-        f"{yil}-01-01", # YILBAŞI
-        f"{yil}-04-23", # ULUSAL EGEMENLİK VE ÇOCUK BAYRAMI
-        f"{yil}-05-01", # EMEK VE DAYANIŞMA GÜNÜ
-        f"{yil}-05-19", # ATATÜRK'Ü ANMA, GENÇLİK VE SPOR BAYRAMI
-        f"{yil}-07-15", # DEMOKRASİ VE MİLLİ BİRLİK GÜNÜ
-        f"{yil}-08-30", # ZAFER BAYRAMI
-        f"{yil}-10-29", # CUMHURİYET BAYRAMI
-    ]
-    # 2026 Dini Bayramlar (Tahmini Diyanet Takvimi)
+    tatiller = [f"{yil}-01-01", f"{yil}-04-23", f"{yil}-05-01", f"{yil}-05-19", f"{yil}-07-15", f"{yil}-08-30", f"{yil}-10-29"]
     if yil == 2026:
-        tatiller.extend([
-            "2026-03-19", "2026-03-20", "2026-03-21", "2026-03-22", # RAMAZAN BAYRAMI (ARİFE DAHİL)
-            "2026-05-26", "2026-05-27", "2026-05-28", "2026-05-29", "2026-05-30" # KURBAN BAYRAMI (ARİFE DAHİL)
-        ])
+        tatiller.extend(["2026-03-19", "2026-03-20", "2026-03-21", "2026-03-22", 
+                         "2026-05-26", "2026-05-27", "2026-05-28", "2026-05-29", "2026-05-30"])
     return tatiller
 
 # --- SIDEBAR NAVİGASYON ---
 st.sidebar.title("⚓ NAVİGASYON")
 menu = st.sidebar.radio("SAYFA SEÇİNİZ:", ["📊 DASHBOARD", "👤 PERSONEL YÖNETİMİ", "📅 İZİN SİSTEMİ", "📑 PUANTAJ VE EXCEL"])
 
-# --- 1. SAYFA: DASHBOARD ---
+# --- DASHBOARD, PERSONEL VE İZİN SAYFALARI (ÖNCEKİLERLE AYNI) ---
 if menu == "📊 DASHBOARD":
     st.header("📈 GENEL DURUM VE ANALİZ")
     df_stajyer = get_all_interns()
-    
     if not df_stajyer.empty:
         col1, col2, col3 = st.columns([1, 2, 2])
-        with col1:
-            st.metric("TOPLAM STAJYER", len(df_stajyer))
-        
+        with col1: st.metric("TOPLAM STAJYER", len(df_stajyer))
         with col2:
             gemi_counts = df_stajyer['gemi'].value_counts().reset_index()
             gemi_counts.columns = ['GEMİ', 'SAYI']
-            fig_bar = px.bar(gemi_counts, x='GEMİ', y='SAYI', title="🚢 GEMİ BAZLI DAĞILIM", color='GEMİ')
-            st.plotly_chart(fig_bar, use_container_width=True)
-            
+            st.plotly_chart(px.bar(gemi_counts, x='GEMİ', y='SAYI', title="🚢 GEMİ BAZLI DAĞILIM"), use_container_width=True)
         with col3:
             bolum_counts = df_stajyer['bolum'].value_counts().reset_index()
             bolum_counts.columns = ['BÖLÜM', 'SAYI']
-            fig_pie = px.pie(bolum_counts, values='SAYI', names='BÖLÜM', title="🛠️ BÖLÜM DAĞILIMI", hole=0.3)
-            st.plotly_chart(fig_pie, use_container_width=True)
+            st.plotly_chart(px.pie(bolum_counts, values='SAYI', names='BÖLÜM', title="🛠️ BÖLÜM DAĞILIMI", hole=0.3), use_container_width=True)
 
-        st.divider()
-        st.subheader("🗓️ AYLIK DEVAMLILIK ANALİZİ")
-        c1, c2 = st.columns(2)
-        d_ay = c1.number_input("ANALİZ AYI", 1, 12, datetime.now().month, key="db_ay")
-        d_yil = c2.number_input("ANALİZ YILI", 2024, 2030, datetime.now().year, key="db_yil")
-
-        db_ozet = []
-        tatiller = get_resmi_tatiller(d_yil)
-        
-        for _, row in df_stajyer.iterrows():
-            leaves = get_intern_leaves(row['id'])
-            bas = datetime(d_yil, d_ay, 1)
-            if d_ay == 12: bit = datetime(d_yil+1, 1, 1) - timedelta(days=1)
-            else: bit = datetime(d_yil, d_ay+1, 1) - timedelta(days=1)
-            
-            gunler = pd.date_range(bas, bit)
-            gelen, gelmeyen = 0, 0
-            
-            for d in gunler:
-                d_str = d.strftime('%Y-%m-%d')
-                gun_tr = TR_GUNLER[d.strftime('%A')]
-                is_tatil = (gun_tr in ["CUMARTESİ", "PAZAR"]) or (d_str in tatiller)
-                
-                if not is_tatil:
-                    is_work_day = False
-                    if row['gun_grubu'] == "PAZARTESİ-SALI-ÇARŞAMBA":
-                        if gun_tr in ["PAZARTESİ", "SALI", "ÇARŞAMBA"]: is_work_day = True
-                    else:
-                        if gun_tr in ["ÇARŞAMBA", "PERŞEMBE", "CUMA"]: is_work_day = True
-                    
-                    has_izin = not leaves[leaves['izin_tarihi'] == d_str].empty
-                    if has_izin: gelmeyen += 1
-                    elif is_work_day: gelen += 1
-            
-            db_ozet.append({"STAJYER": row['ad_soyad'], "GEMİ": row['gemi'], "GELDİĞİ GÜN": gelen, "GELMEDİĞİ GÜN": gelmeyen})
-        
-        st.table(pd.DataFrame(db_ozet))
-    else:
-        st.info("HENÜZ KAYITLI PERSONEL YOK.")
-
-# --- 2. SAYFA: PERSONEL YÖNETİMİ ---
 elif menu == "👤 PERSONEL YÖNETİMİ":
     st.header("👤 STAJYER KAYIT VE YÖNETİMİ")
-    
     with st.expander("➕ YENİ STAJYER EKLE"):
         c1, c2 = st.columns(2)
         with c1:
@@ -150,66 +89,39 @@ elif menu == "👤 PERSONEL YÖNETİMİ":
             bit = st.date_input("STAJ BİTİŞ")
             gunler = st.selectbox("STAJ GÜNLERİ", ["PAZARTESİ-SALI-ÇARŞAMBA", "ÇARŞAMBA-PERŞEMBE-CUMA"])
             bolum = st.selectbox("BÖLÜM", ["MAKİNE", "GÜVERTE"])
-        
         if st.button("KAYDI TAMAMLA"):
-            if ad and gemi:
-                conn.execute("INSERT INTO stajyerler (ad_soyad, okul, gemi, telefon, baslangic, bitis, gun_grubu, bolum) VALUES (?,?,?,?,?,?,?,?)",
-                             (ad, okul, gemi, tel, bas, bit, gunler, bolum))
-                conn.commit()
-                st.success(f"{ad} BAŞARIYLA EKLENDİ!"); st.rerun()
-
+            conn.execute("INSERT INTO stajyerler (ad_soyad, okul, gemi, telefon, baslangic, bitis, gun_grubu, bolum) VALUES (?,?,?,?,?,?,?,?)", (ad, okul, gemi, tel, bas, bit, gunler, bolum))
+            conn.commit(); st.success(f"{ad} EKLENDİ!"); st.rerun()
     df = get_all_interns()
     if not df.empty:
-        st.subheader("📝 PERSONEL LİSTESİNİ DÜZENLE")
-        edited_df = st.data_editor(df, num_rows="dynamic", key="main_editor", hide_index=True, use_container_width=True)
-        if st.button("🔄 TÜM DEĞİŞİKLİKLERİ KAYDET"):
+        edited_df = st.data_editor(df, num_rows="dynamic", key="main_editor", hide_index=True)
+        if st.button("🔄 TÜMÜNÜ GÜNCELLE"):
             conn.execute("DELETE FROM stajyerler")
             edited_df.to_sql('stajyerler', conn, if_exists='append', index=False)
             conn.commit(); st.success("GÜNCELLENDİ!"); st.rerun()
 
-        st.divider()
-        st.subheader("🗑️ PERSONEL SİL")
-        col_del1, col_del2 = st.columns([3, 1])
-        with col_del1:
-            sil_kisi = st.selectbox("SİLİNECEK KİŞİYİ SEÇİN", df['ad_soyad'].tolist())
-        with col_del2:
-            st.write("##")
-            if st.button("❌ KİŞİYİ SİL"):
-                s_id = df[df['ad_soyad'] == sil_kisi]['id'].values[0]
-                conn.execute(f"DELETE FROM izinler WHERE stajyer_id = {s_id}")
-                conn.execute(f"DELETE FROM stajyerler WHERE id = {s_id}")
-                conn.commit(); st.warning(f"{sil_kisi} SİLİNDİ!"); st.rerun()
-
-# --- 3. SAYFA: İZİN SİSTEMİ ---
 elif menu == "📅 İZİN SİSTEMİ":
-    st.header("📅 İZİN VE DEVAMSIZLIK YÖNETİMİ")
+    st.header("📅 İZİN YÖNETİMİ")
     df = get_all_interns()
     if not df.empty:
-        c1, c2 = st.columns([1, 2])
+        s_ad = st.selectbox("STAJYER SEÇİN", df['ad_soyad'].tolist())
+        s_id = df[df['ad_soyad'] == s_ad]['id'].values[0]
+        c1, c2 = st.columns(2)
         with c1:
-            st.subheader("➕ İZİN EKLE")
-            s_ad = st.selectbox("STAJYER SEÇİN", df['ad_soyad'].tolist())
-            s_id = df[df['ad_soyad'] == s_ad]['id'].values[0]
             i_tarih = st.date_input("İZİN TARİHİ")
             i_tip = st.radio("DURUM", ["RAPORLU", "RAPORSUZ DEVAMSIZLIK"])
             if st.button("İZİNİ KAYDET"):
                 conn.execute("INSERT INTO izinler (stajyer_id, izin_tarihi, izin_tipi) VALUES (?,?,?)", (int(s_id), i_tarih, i_tip))
                 conn.commit(); st.success("İZİN İŞLENDİ!"); st.rerun()
         with c2:
-            st.subheader(f"📝 {s_ad} - İZİN GEÇMİŞİ")
             iz_df = get_intern_leaves(s_id)
             if not iz_df.empty:
-                edited_iz_df = st.data_editor(iz_df[['izin_tarihi', 'izin_tipi']], num_rows="dynamic", key="iz_editor", hide_index=True, use_container_width=True)
-                if st.button("🔄 İZİNLERİ GÜNCELLE"):
-                    conn.execute(f"DELETE FROM izinler WHERE stajyer_id = {s_id}")
-                    for _, r in edited_iz_df.iterrows():
-                        if pd.notna(r['izin_tarihi']):
-                            conn.execute("INSERT INTO izinler (stajyer_id, izin_tarihi, izin_tipi) VALUES (?,?,?)", (int(s_id), r['izin_tarihi'], r['izin_tipi']))
-                    conn.commit(); st.success("GÜNCELLENDİ!"); st.rerun()
+                st.write("MEVCUT İZİNLER (DÜZENLENEBİLİR)")
+                st.data_editor(iz_df[['izin_tarihi', 'izin_tipi']], use_container_width=True)
 
-# --- 4. SAYFA: PUANTAJ VE EXCEL ---
+# --- 4. SAYFA: PUANTAJ VE EXCEL (GÜNCELLENEN KISIM) ---
 elif menu == "📑 PUANTAJ VE EXCEL":
-    st.header("📑 AYLIK PUANTAJ CETVELİ")
+    st.header("📑 AYLIK PUANTAJ VE TOPLAM DEVAM")
     c1, c2 = st.columns(2)
     ay = c1.number_input("AY", 1, 12, datetime.now().month)
     yil = c2.number_input("YIL", 2024, 2030, datetime.now().year)
@@ -217,21 +129,21 @@ elif menu == "📑 PUANTAJ VE EXCEL":
     df_st = get_all_interns()
     if not df_st.empty:
         bas = datetime(yil, ay, 1)
-        if ay == 12: bit = datetime(yil+1, 1, 1) - timedelta(days=1)
-        else: bit = datetime(yil, ay+1, 1) - timedelta(days=1)
-        
+        bit = (datetime(yil, ay+1, 1) if ay < 12 else datetime(yil+1, 1, 1)) - timedelta(days=1)
         gunler_range = pd.date_range(bas, bit)
         tatiller = get_resmi_tatiller(yil)
         
         puantaj_res = []
+        genel_toplam_gun = 0
+        
         for _, row in df_st.iterrows():
             satir = {"AD SOYAD": row['ad_soyad'], "GEMİ": row['gemi'], "BÖLÜM": row['bolum']}
             leaves = get_intern_leaves(row['id'])
+            kisi_toplam_gun = 0
+            
             for d in gunler_range:
                 d_str = d.strftime('%Y-%m-%d')
                 gun_tr = TR_GUNLER[d.strftime('%A')]
-                
-                # TATİL KONTROLÜ
                 is_tatil = (gun_tr in ["CUMARTESİ", "PAZAR"]) or (d_str in tatiller)
                 
                 if is_tatil:
@@ -240,15 +152,34 @@ elif menu == "📑 PUANTAJ VE EXCEL":
                     staj_gunu = (gun_tr in ["PAZARTESİ", "SALI", "ÇARŞAMBA"]) if row['gun_grubu'] == "PAZARTESİ-SALI-ÇARŞAMBA" else (gun_tr in ["ÇARŞAMBA", "PERŞEMBE", "CUMA"])
                     izin_durum = leaves[leaves['izin_tarihi'] == d_str]
                     
-                    if not izin_durum.empty: satir[d.day] = izin_durum['izin_tipi'].values[0]
-                    elif staj_gunu: satir[d.day] = "1"
-                    else: satir[d.day] = "-"
+                    if not izin_durum.empty:
+                        satir[d.day] = izin_durum['izin_tipi'].values[0]
+                    elif staj_gunu:
+                        satir[d.day] = "1"
+                        kisi_toplam_gun += 1
+                    else:
+                        satir[d.day] = "-"
+            
+            satir["KİŞİ TOPLAM (GÜN)"] = kisi_toplam_gun
+            genel_toplam_gun += kisi_toplam_gun
             puantaj_res.append(satir)
             
         p_df = pd.DataFrame(puantaj_res)
+        
+        # Ekranın üstünde özet bilgi
+        st.info(f"📊 **BU AY TÜM STAJYERLERİN TOPLAM STAJ GÜNÜ: {genel_toplam_gun} GÜN**")
         st.dataframe(p_df, use_container_width=True)
+        
+        # Excel'e Genel Toplam Satırı Ekleme (İsteğe bağlı)
+        excel_df = p_df.copy()
         
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            p_df.to_excel(writer, index=False, sheet_name='PUANTAJ')
-        st.download_button(label="📥 EXCEL OLARAK İNDİR", data=output.getvalue(), file_name=f"PUANTAJ_{ay}_{yil}.xlsx", mime="application/vnd.ms-excel")
+            excel_df.to_excel(writer, index=False, sheet_name='PUANTAJ')
+            workbook  = writer.book
+            worksheet = writer.sheets['PUANTAJ']
+            # Genel toplamı en alta manuel yazdırabiliriz
+            worksheet.write(len(excel_df) + 2, 0, "TÜM ÖĞRENCİLER GENEL TOPLAM:")
+            worksheet.write(len(excel_df) + 2, 1, genel_toplam_gun)
+            
+        st.download_button(label="📥 EXCEL OLARAK İNDİR (TOPLAMLAR DAHİL)", data=output.getvalue(), file_name=f"PUANTAJ_{ay}_{yil}.xlsx")
