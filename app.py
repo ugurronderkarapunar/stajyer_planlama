@@ -6,17 +6,18 @@ import io
 import plotly.express as px
 
 # --- SAYFA AYARLARI ---
-st.set_page_config(page_title="STAJYER PLANLAMA SİSTEMİ", layout="wide")
+st.set_page_config(page_title="STAJYER PLANLAMA VE YÖNETİM SİSTEMİ", layout="wide")
 
-# Tüm metinleri büyük harf yapma ve modern stil (CSS)
+# TÜM METİNLERİ BÜYÜK HARF YAPMA VE MODERN STİL (CSS)
 st.markdown("""
     <style>
     .main { background-color: #f8f9fa; }
-    h1, h2, h3, h4, label, .stButton>button, .stMarkdown, p, span { 
+    h1, h2, h3, h4, label, .stButton>button, .stMarkdown, p, span, .stMetric { 
         text-transform: uppercase !important; 
         font-weight: bold !important;
     }
-    .stDataFrame, .stTable { border-radius: 10px; }
+    .stDataFrame, .stTable { border-radius: 10px; border: 1px solid #e0e0e0; }
+    div[data-baseweb="select"] > div { text-transform: uppercase; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -41,7 +42,7 @@ def get_all_interns():
     return pd.read_sql("SELECT * FROM stajyerler", conn)
 
 def get_intern_leaves(intern_id):
-    return pd.read_sql(f"SELECT izin_tarihi, izin_tipi FROM izinler WHERE stajyer_id = {intern_id}", conn)
+    return pd.read_sql(f"SELECT id, izin_tarihi, izin_tipi FROM izinler WHERE stajyer_id = {intern_id}", conn)
 
 TR_GUNLER = {
     'Monday': 'PAZARTESİ', 'Tuesday': 'SALI', 'Wednesday': 'ÇARŞAMBA',
@@ -84,8 +85,10 @@ if menu == "📊 DASHBOARD":
         for _, row in df_stajyer.iterrows():
             leaves = get_intern_leaves(row['id'])
             bas = datetime(d_yil, d_ay, 1)
-            next_month = bas.replace(day=28) + timedelta(days=4)
-            bit = next_month - timedelta(days=next_month.day)
+            # Bir sonraki ayın ilk gününden bir gün çıkararak ayın son gününü bulma
+            if d_ay == 12: bit = datetime(d_yil+1, 1, 1) - timedelta(days=1)
+            else: bit = datetime(d_yil, d_ay+1, 1) - timedelta(days=1)
+            
             gunler = pd.date_range(bas, bit)
             
             gelen, gelmeyen = 0, 0
@@ -110,7 +113,8 @@ if menu == "📊 DASHBOARD":
 
 # --- 2. SAYFA: PERSONEL YÖNETİMİ ---
 elif menu == "👤 PERSONEL YÖNETİMİ":
-    st.header("👤 STAJYER KAYIT VE DÜZENLEME")
+    st.header("👤 STAJYER KAYIT VE YÖNETİMİ")
+    
     with st.expander("➕ YENİ STAJYER EKLE"):
         c1, c2 = st.columns(2)
         with c1:
@@ -125,41 +129,92 @@ elif menu == "👤 PERSONEL YÖNETİMİ":
             bolum = st.selectbox("BÖLÜM", ["MAKİNE", "GÜVERTE"])
         
         if st.button("KAYDI TAMAMLA"):
-            conn.execute("INSERT INTO stajyerler (ad_soyad, okul, gemi, telefon, baslangic, bitis, gun_grubu, bolum) VALUES (?,?,?,?,?,?,?,?)",
-                         (ad, okul, gemi, tel, bas, bit, gunler, bolum))
-            conn.commit()
-            st.success("KAYIT BAŞARILI!"); st.rerun()
+            if ad and gemi:
+                conn.execute("INSERT INTO stajyerler (ad_soyad, okul, gemi, telefon, baslangic, bitis, gun_grubu, bolum) VALUES (?,?,?,?,?,?,?,?)",
+                             (ad, okul, gemi, tel, bas, bit, gunler, bolum))
+                conn.commit()
+                st.success(f"{ad} BAŞARIYLA EKLENDİ!"); st.rerun()
+            else:
+                st.error("AD SOYAD VE GEMİ ALANLARI ZORUNLUDUR!")
 
     df = get_all_interns()
     if not df.empty:
-        st.subheader("📋 PERSONEL LİSTESİ (DÜZENLEME VE SİLME)")
-        edited_df = st.data_editor(df, num_rows="dynamic", key="main_editor", hide_index=True)
-        if st.button("TÜM DEĞİŞİKLİKLERİ KAYDET"):
+        st.subheader("📝 PERSONEL LİSTESİNİ DÜZENLE")
+        edited_df = st.data_editor(df, num_rows="dynamic", key="main_editor", hide_index=True, use_container_width=True)
+        if st.button("🔄 TÜM DEĞİŞİKLİKLERİ KAYDET"):
             conn.execute("DELETE FROM stajyerler")
             edited_df.to_sql('stajyerler', conn, if_exists='append', index=False)
-            conn.commit(); st.success("GÜNCELLENDİ!")
+            conn.commit(); st.success("VERİLER GÜNCELLENDİ!"); st.rerun()
+
+        st.divider()
+        st.subheader("🗑️ PERSONEL SİL")
+        col_del1, col_del2 = st.columns([3, 1])
+        with col_del1:
+            sil_kisi = st.selectbox("SİLİNECEK KİŞİYİ SEÇİN", df['ad_soyad'].tolist())
+        with col_del2:
+            st.write("##")
+            if st.button("❌ KİŞİYİ SİL"):
+                s_id = df[df['ad_soyad'] == sil_kisi]['id'].values[0]
+                conn.execute(f"DELETE FROM izinler WHERE stajyer_id = {s_id}")
+                conn.execute(f"DELETE FROM stajyerler WHERE id = {s_id}")
+                conn.commit(); st.warning(f"{sil_kisi} SİLİNDİ!"); st.rerun()
     else:
         st.info("LİSTE BOŞ.")
 
 # --- 3. SAYFA: İZİN SİSTEMİ ---
 elif menu == "📅 İZİN SİSTEMİ":
-    st.header("📅 İZİN VE DEVAMSIZLIK GİRİŞİ")
+    st.header("📅 İZİN VE DEVAMSIZLIK YÖNETİMİ")
     df = get_all_interns()
     if not df.empty:
         c1, c2 = st.columns([1, 2])
+        
+        # SOL TARAF: İZİN EKLEME
         with c1:
+            st.subheader("➕ İZİN EKLE")
             s_ad = st.selectbox("STAJYER SEÇİN", df['ad_soyad'].tolist())
             s_id = df[df['ad_soyad'] == s_ad]['id'].values[0]
             i_tarih = st.date_input("İZİN TARİHİ")
             i_tip = st.radio("DURUM", ["RAPORLU", "RAPORSUZ DEVAMSIZLIK"])
             if st.button("İZİNİ KAYDET"):
                 conn.execute("INSERT INTO izinler (stajyer_id, izin_tarihi, izin_tipi) VALUES (?,?,?)", (int(s_id), i_tarih, i_tip))
-                conn.commit(); st.toast("İŞLENDİ")
+                conn.commit(); st.success("İZİN İŞLENDİ!"); st.rerun()
+                
+        # SAĞ TARAF: İZİN GEÇMİŞİ, DÜZENLEME VE SİLME
         with c2:
-            st.subheader("GİRİLEN İZİNLER")
-            st.write(pd.read_sql(f"SELECT id, izin_tarihi, izin_tipi FROM izinler WHERE stajyer_id = {s_id}", conn))
+            st.subheader(f"📝 {s_ad} - İZİN GEÇMİŞİ VE DÜZENLEME")
+            st.info("TABLO ÜZERİNDEN İZİN TARİHİNİ/TİPİNİ DEĞİŞTİREBİLİR VEYA SATIR SİLEREK İZİNİ İPTAL EDEBİLİRSİNİZ.")
+            
+            iz_df = get_intern_leaves(s_id)
+            
+            if not iz_df.empty:
+                # İzin Düzenleme Editörü (id sütununu gizliyoruz, sadece tarih ve tip düzenlenebilir)
+                edited_iz_df = st.data_editor(iz_df[['izin_tarihi', 'izin_tipi']], num_rows="dynamic", key="izin_editor", hide_index=True, use_container_width=True)
+                
+                if st.button("🔄 İZİNLERİ GÜNCELLE"):
+                    # Seçili stajyerin tüm izinlerini silip editördeki son haliyle tekrar ekliyoruz
+                    conn.execute(f"DELETE FROM izinler WHERE stajyer_id = {s_id}")
+                    for _, row in edited_iz_df.iterrows():
+                        if pd.notna(row['izin_tarihi']): # Boş satırları filtrele
+                            conn.execute("INSERT INTO izinler (stajyer_id, izin_tarihi, izin_tipi) VALUES (?,?,?)", (int(s_id), row['izin_tarihi'], row['izin_tipi']))
+                    conn.commit()
+                    st.success("İZİN KAYITLARI GÜNCELLENDİ!"); st.rerun()
+                    
+                st.divider()
+                st.subheader("🗑️ TEKLİ İZİN SİLME")
+                col_i1, col_i2 = st.columns([2,1])
+                with col_i1:
+                    sil_izin_tarih = st.selectbox("SİLİNECEK İZİN TARİHİNİ SEÇİN", iz_df['izin_tarihi'].tolist())
+                with col_i2:
+                    st.write("##")
+                    if st.button("❌ SEÇİLİ İZNİ SİL"):
+                        del_izin_id = iz_df[iz_df['izin_tarihi'] == sil_izin_tarih]['id'].values[0]
+                        conn.execute(f"DELETE FROM izinler WHERE id = {int(del_izin_id)}")
+                        conn.commit()
+                        st.warning("İZİN SİLİNDİ!"); st.rerun()
+            else:
+                st.warning("BU KİŞİYE AİT İZİN KAYDI BULUNMAMAKTADIR.")
     else:
-        st.warning("PERSONEL YOK.")
+        st.warning("SİSTEMDE KAYITLI PERSONEL BULUNMUYOR.")
 
 # --- 4. SAYFA: PUANTAJ VE EXCEL ---
 elif menu == "📑 PUANTAJ VE EXCEL":
@@ -170,8 +225,9 @@ elif menu == "📑 PUANTAJ VE EXCEL":
     df_st = get_all_interns()
     if not df_st.empty:
         bas = datetime(yil, ay, 1)
-        next_month = bas.replace(day=28) + timedelta(days=4)
-        bit = next_month - timedelta(days=next_month.day)
+        if ay == 12: bit = datetime(yil+1, 1, 1) - timedelta(days=1)
+        else: bit = datetime(yil, ay+1, 1) - timedelta(days=1)
+        
         gunler_range = pd.date_range(bas, bit)
         
         puantaj_res = []
@@ -190,7 +246,7 @@ elif menu == "📑 PUANTAJ VE EXCEL":
             puantaj_res.append(satir)
             
         p_df = pd.DataFrame(puantaj_res)
-        st.dataframe(p_df)
+        st.dataframe(p_df, use_container_width=True)
         
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
