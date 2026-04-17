@@ -17,7 +17,6 @@ st.markdown("""
         font-weight: bold !important;
     }
     .stDataFrame, .stTable { border-radius: 10px; border: 1px solid #e0e0e0; }
-    div[data-baseweb="select"] > div { text-transform: uppercase; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -48,6 +47,26 @@ TR_GUNLER = {
     'Monday': 'PAZARTESİ', 'Tuesday': 'SALI', 'Wednesday': 'ÇARŞAMBA',
     'Thursday': 'PERŞEMBE', 'Friday': 'CUMA', 'Saturday': 'CUMARTESİ', 'Sunday': 'PAZAR'
 }
+
+# 2026 RESMİ TATİLLER VE DİNİ BAYRAMLAR
+def get_resmi_tatiller(yil):
+    # Sabit Resmi Tatiller
+    tatiller = [
+        f"{yil}-01-01", # YILBAŞI
+        f"{yil}-04-23", # ULUSAL EGEMENLİK VE ÇOCUK BAYRAMI
+        f"{yil}-05-01", # EMEK VE DAYANIŞMA GÜNÜ
+        f"{yil}-05-19", # ATATÜRK'Ü ANMA, GENÇLİK VE SPOR BAYRAMI
+        f"{yil}-07-15", # DEMOKRASİ VE MİLLİ BİRLİK GÜNÜ
+        f"{yil}-08-30", # ZAFER BAYRAMI
+        f"{yil}-10-29", # CUMHURİYET BAYRAMI
+    ]
+    # 2026 Dini Bayramlar (Tahmini Diyanet Takvimi)
+    if yil == 2026:
+        tatiller.extend([
+            "2026-03-19", "2026-03-20", "2026-03-21", "2026-03-22", # RAMAZAN BAYRAMI (ARİFE DAHİL)
+            "2026-05-26", "2026-05-27", "2026-05-28", "2026-05-29", "2026-05-30" # KURBAN BAYRAMI (ARİFE DAHİL)
+        ])
+    return tatiller
 
 # --- SIDEBAR NAVİGASYON ---
 st.sidebar.title("⚓ NAVİGASYON")
@@ -82,28 +101,32 @@ if menu == "📊 DASHBOARD":
         d_yil = c2.number_input("ANALİZ YILI", 2024, 2030, datetime.now().year, key="db_yil")
 
         db_ozet = []
+        tatiller = get_resmi_tatiller(d_yil)
+        
         for _, row in df_stajyer.iterrows():
             leaves = get_intern_leaves(row['id'])
             bas = datetime(d_yil, d_ay, 1)
-            # Bir sonraki ayın ilk gününden bir gün çıkararak ayın son gününü bulma
             if d_ay == 12: bit = datetime(d_yil+1, 1, 1) - timedelta(days=1)
             else: bit = datetime(d_yil, d_ay+1, 1) - timedelta(days=1)
             
             gunler = pd.date_range(bas, bit)
-            
             gelen, gelmeyen = 0, 0
+            
             for d in gunler:
                 d_str = d.strftime('%Y-%m-%d')
                 gun_tr = TR_GUNLER[d.strftime('%A')]
-                is_work_day = False
-                if row['gun_grubu'] == "PAZARTESİ-SALI-ÇARŞAMBA":
-                    if gun_tr in ["PAZARTESİ", "SALI", "ÇARŞAMBA"]: is_work_day = True
-                else:
-                    if gun_tr in ["ÇARŞAMBA", "PERŞEMBE", "CUMA"]: is_work_day = True
+                is_tatil = (gun_tr in ["CUMARTESİ", "PAZAR"]) or (d_str in tatiller)
                 
-                has_izin = not leaves[leaves['izin_tarihi'] == d_str].empty
-                if has_izin: gelmeyen += 1
-                elif is_work_day: gelen += 1
+                if not is_tatil:
+                    is_work_day = False
+                    if row['gun_grubu'] == "PAZARTESİ-SALI-ÇARŞAMBA":
+                        if gun_tr in ["PAZARTESİ", "SALI", "ÇARŞAMBA"]: is_work_day = True
+                    else:
+                        if gun_tr in ["ÇARŞAMBA", "PERŞEMBE", "CUMA"]: is_work_day = True
+                    
+                    has_izin = not leaves[leaves['izin_tarihi'] == d_str].empty
+                    if has_izin: gelmeyen += 1
+                    elif is_work_day: gelen += 1
             
             db_ozet.append({"STAJYER": row['ad_soyad'], "GEMİ": row['gemi'], "GELDİĞİ GÜN": gelen, "GELMEDİĞİ GÜN": gelmeyen})
         
@@ -134,8 +157,6 @@ elif menu == "👤 PERSONEL YÖNETİMİ":
                              (ad, okul, gemi, tel, bas, bit, gunler, bolum))
                 conn.commit()
                 st.success(f"{ad} BAŞARIYLA EKLENDİ!"); st.rerun()
-            else:
-                st.error("AD SOYAD VE GEMİ ALANLARI ZORUNLUDUR!")
 
     df = get_all_interns()
     if not df.empty:
@@ -144,7 +165,7 @@ elif menu == "👤 PERSONEL YÖNETİMİ":
         if st.button("🔄 TÜM DEĞİŞİKLİKLERİ KAYDET"):
             conn.execute("DELETE FROM stajyerler")
             edited_df.to_sql('stajyerler', conn, if_exists='append', index=False)
-            conn.commit(); st.success("VERİLER GÜNCELLENDİ!"); st.rerun()
+            conn.commit(); st.success("GÜNCELLENDİ!"); st.rerun()
 
         st.divider()
         st.subheader("🗑️ PERSONEL SİL")
@@ -158,8 +179,6 @@ elif menu == "👤 PERSONEL YÖNETİMİ":
                 conn.execute(f"DELETE FROM izinler WHERE stajyer_id = {s_id}")
                 conn.execute(f"DELETE FROM stajyerler WHERE id = {s_id}")
                 conn.commit(); st.warning(f"{sil_kisi} SİLİNDİ!"); st.rerun()
-    else:
-        st.info("LİSTE BOŞ.")
 
 # --- 3. SAYFA: İZİN SİSTEMİ ---
 elif menu == "📅 İZİN SİSTEMİ":
@@ -167,8 +186,6 @@ elif menu == "📅 İZİN SİSTEMİ":
     df = get_all_interns()
     if not df.empty:
         c1, c2 = st.columns([1, 2])
-        
-        # SOL TARAF: İZİN EKLEME
         with c1:
             st.subheader("➕ İZİN EKLE")
             s_ad = st.selectbox("STAJYER SEÇİN", df['ad_soyad'].tolist())
@@ -178,48 +195,24 @@ elif menu == "📅 İZİN SİSTEMİ":
             if st.button("İZİNİ KAYDET"):
                 conn.execute("INSERT INTO izinler (stajyer_id, izin_tarihi, izin_tipi) VALUES (?,?,?)", (int(s_id), i_tarih, i_tip))
                 conn.commit(); st.success("İZİN İŞLENDİ!"); st.rerun()
-                
-        # SAĞ TARAF: İZİN GEÇMİŞİ, DÜZENLEME VE SİLME
         with c2:
-            st.subheader(f"📝 {s_ad} - İZİN GEÇMİŞİ VE DÜZENLEME")
-            st.info("TABLO ÜZERİNDEN İZİN TARİHİNİ/TİPİNİ DEĞİŞTİREBİLİR VEYA SATIR SİLEREK İZİNİ İPTAL EDEBİLİRSİNİZ.")
-            
+            st.subheader(f"📝 {s_ad} - İZİN GEÇMİŞİ")
             iz_df = get_intern_leaves(s_id)
-            
             if not iz_df.empty:
-                # İzin Düzenleme Editörü
-                edited_iz_df = st.data_editor(iz_df[['izin_tarihi', 'izin_tipi']], num_rows="dynamic", key="izin_editor", hide_index=True, use_container_width=True)
-                
+                edited_iz_df = st.data_editor(iz_df[['izin_tarihi', 'izin_tipi']], num_rows="dynamic", key="iz_editor", hide_index=True, use_container_width=True)
                 if st.button("🔄 İZİNLERİ GÜNCELLE"):
                     conn.execute(f"DELETE FROM izinler WHERE stajyer_id = {s_id}")
-                    for _, row in edited_iz_df.iterrows():
-                        if pd.notna(row['izin_tarihi']):
-                            conn.execute("INSERT INTO izinler (stajyer_id, izin_tarihi, izin_tipi) VALUES (?,?,?)", (int(s_id), row['izin_tarihi'], row['izin_tipi']))
-                    conn.commit()
-                    st.success("İZİN KAYITLARI GÜNCELLENDİ!"); st.rerun()
-                    
-                st.divider()
-                st.subheader("🗑️ TEKLİ İZİN SİLME")
-                col_i1, col_i2 = st.columns([2,1])
-                with col_i1:
-                    sil_izin_tarih = st.selectbox("SİLİNECEK İZİN TARİHİNİ SEÇİN", iz_df['izin_tarihi'].tolist())
-                with col_i2:
-                    st.write("##")
-                    if st.button("❌ SEÇİLİ İZNİ SİL"):
-                        del_izin_id = iz_df[iz_df['izin_tarihi'] == sil_izin_tarih]['id'].values[0]
-                        conn.execute(f"DELETE FROM izinler WHERE id = {int(del_izin_id)}")
-                        conn.commit()
-                        st.warning("İZİN SİLİNDİ!"); st.rerun()
-            else:
-                st.warning("BU KİŞİYE AİT İZİN KAYDI BULUNMAMAKTADIR.")
-    else:
-        st.warning("SİSTEMDE KAYITLI PERSONEL BULUNMUYOR.")
+                    for _, r in edited_iz_df.iterrows():
+                        if pd.notna(r['izin_tarihi']):
+                            conn.execute("INSERT INTO izinler (stajyer_id, izin_tarihi, izin_tipi) VALUES (?,?,?)", (int(s_id), r['izin_tarihi'], r['izin_tipi']))
+                    conn.commit(); st.success("GÜNCELLENDİ!"); st.rerun()
 
 # --- 4. SAYFA: PUANTAJ VE EXCEL ---
 elif menu == "📑 PUANTAJ VE EXCEL":
     st.header("📑 AYLIK PUANTAJ CETVELİ")
-    ay = st.number_input("AY", 1, 12, datetime.now().month)
-    yil = st.number_input("YIL", 2024, 2030, datetime.now().year)
+    c1, c2 = st.columns(2)
+    ay = c1.number_input("AY", 1, 12, datetime.now().month)
+    yil = c2.number_input("YIL", 2024, 2030, datetime.now().year)
     
     df_st = get_all_interns()
     if not df_st.empty:
@@ -228,6 +221,7 @@ elif menu == "📑 PUANTAJ VE EXCEL":
         else: bit = datetime(yil, ay+1, 1) - timedelta(days=1)
         
         gunler_range = pd.date_range(bas, bit)
+        tatiller = get_resmi_tatiller(yil)
         
         puantaj_res = []
         for _, row in df_st.iterrows():
@@ -236,12 +230,19 @@ elif menu == "📑 PUANTAJ VE EXCEL":
             for d in gunler_range:
                 d_str = d.strftime('%Y-%m-%d')
                 gun_tr = TR_GUNLER[d.strftime('%A')]
-                staj_gunu = (gun_tr in ["PAZARTESİ", "SALI", "ÇARŞAMBA"]) if row['gun_grubu'] == "PAZARTESİ-SALI-ÇARŞAMBA" else (gun_tr in ["ÇARŞAMBA", "PERŞEMBE", "CUMA"])
                 
-                izin_durum = leaves[leaves['izin_tarihi'] == d_str]
-                if not izin_durum.empty: satir[d.day] = izin_durum['izin_tipi'].values[0]
-                elif staj_gunu: satir[d.day] = "1"
-                else: satir[d.day] = "-"
+                # TATİL KONTROLÜ
+                is_tatil = (gun_tr in ["CUMARTESİ", "PAZAR"]) or (d_str in tatiller)
+                
+                if is_tatil:
+                    satir[d.day] = "TATİL"
+                else:
+                    staj_gunu = (gun_tr in ["PAZARTESİ", "SALI", "ÇARŞAMBA"]) if row['gun_grubu'] == "PAZARTESİ-SALI-ÇARŞAMBA" else (gun_tr in ["ÇARŞAMBA", "PERŞEMBE", "CUMA"])
+                    izin_durum = leaves[leaves['izin_tarihi'] == d_str]
+                    
+                    if not izin_durum.empty: satir[d.day] = izin_durum['izin_tipi'].values[0]
+                    elif staj_gunu: satir[d.day] = "1"
+                    else: satir[d.day] = "-"
             puantaj_res.append(satir)
             
         p_df = pd.DataFrame(puantaj_res)
