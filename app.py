@@ -58,13 +58,24 @@ def init_db():
         if kolon not in mevcut_kolonlar:
             c.execute(f"ALTER TABLE stajyerler ADD COLUMN {kolon} {tip}")
 
+    # İzin tablosu migrasyonu: eski izin_tarihi sütununu yeni yapıya taşı
     izin_kolonlar = [r[1] for r in c.execute("PRAGMA table_info(izinler)").fetchall()]
-    if "izin_bitis" not in izin_kolonlar:
-        c.execute("ALTER TABLE izinler ADD COLUMN izin_bitis DATE")
-    # Eski tek tarihli kayıtları güncelle: bitis = baslangic
     if "izin_tarihi" in izin_kolonlar:
-        c.execute("UPDATE izinler SET izin_baslangic = izin_tarihi WHERE izin_baslangic IS NULL")
-        c.execute("UPDATE izinler SET izin_bitis = izin_tarihi WHERE izin_bitis IS NULL")
+        # SQLite sütun yeniden adlandırmayı desteklemez → tabloyu yeniden oluştur
+        c.execute('''CREATE TABLE IF NOT EXISTS izinler_yeni
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      stajyer_id INTEGER,
+                      izin_baslangic DATE,
+                      izin_bitis DATE,
+                      izin_tipi TEXT,
+                      FOREIGN KEY(stajyer_id) REFERENCES stajyerler(id))''')
+        c.execute('''INSERT INTO izinler_yeni (id, stajyer_id, izin_baslangic, izin_bitis, izin_tipi)
+                     SELECT id, stajyer_id, izin_tarihi, izin_tarihi, izin_tipi FROM izinler''')
+        c.execute("DROP TABLE izinler")
+        c.execute("ALTER TABLE izinler_yeni RENAME TO izinler")
+    elif "izin_bitis" not in izin_kolonlar:
+        c.execute("ALTER TABLE izinler ADD COLUMN izin_bitis DATE")
+        c.execute("UPDATE izinler SET izin_bitis = izin_baslangic WHERE izin_bitis IS NULL")
 
     conn.commit()
     return conn
@@ -107,13 +118,56 @@ def izin_var_mi(leaves_df, d_str):
             return row['izin_tipi']
     return None
 
+
+def stajyer_istatistik(row, baslangic_dt, bitis_dt, tatiller_listesi):
+    """Bir stajyer icin verilen tarih araliginda devam istatistiklerini hesaplar."""
+    gunler_range = pd.date_range(baslangic_dt, bitis_dt)
+    leaves = get_intern_leaves(row['id'])
+    toplam_staj_gunu = 0
+    devam_gunu = 0
+    raporlu_gun = 0
+    raporsuz_gun = 0
+
+    for d in gunler_range:
+        d_str  = d.strftime('%Y-%m-%d')
+        gun_tr = TR_GUNLER[d.strftime('%A')]
+        is_tatil = (gun_tr in ["CUMARTESI", "PAZAR"]) or (d_str in tatiller_listesi)
+        if is_tatil:
+            continue
+        staj_gunu = (
+            gun_tr in ["PAZARTESI", "SALI", "CARSAMBA"]
+            if row['gun_grubu'] == "PAZARTESI-SALI-CARSAMBA"
+            else gun_tr in ["CARSAMBA", "PERSEMBE", "CUMA"]
+        )
+        if not staj_gunu:
+            continue
+        toplam_staj_gunu += 1
+        izin_tipi = izin_var_mi(leaves, d_str)
+        if izin_tipi == "RAPORLU":
+            raporlu_gun += 1
+        elif izin_tipi == "RAPORSUZ DEVAMSIZLIK":
+            raporsuz_gun += 1
+        else:
+            devam_gunu += 1
+
+    oran = round(devam_gunu / toplam_staj_gunu * 100, 1) if toplam_staj_gunu > 0 else 0
+    return {
+        "toplam_staj_gunu": toplam_staj_gunu,
+        "devam_gunu": devam_gunu,
+        "raporlu_gun": raporlu_gun,
+        "raporsuz_gun": raporsuz_gun,
+        "devam_orani": oran,
+    }
+
 # --- SIDEBAR NAVİGASYON ---
 st.sidebar.title("⚓ NAVİGASYON")
 menu = st.sidebar.radio("SAYFA SEÇİNİZ:", [
     "📊 DASHBOARD",
     "👤 PERSONEL YÖNETİMİ",
     "📅 İZİN SİSTEMİ",
-    "📑 PUANTAJ VE EXCEL"
+    "📑 PUANTAJ VE EXCEL",
+    "👁️ KİŞİ BAZLI DEVAM RAPORU",
+    "🔍 GELİŞMİŞ FİLTRELEME",
 ])
 
 # =============================================================
@@ -331,3 +385,206 @@ elif menu == "📑 PUANTAJ VE EXCEL":
         )
     else:
         st.warning("SİSTEMDE KAYITLI STAJYER BULUNAMADI.")
+
+
+# =============================================================
+# 5. KİŞİ BAZLI DEVAM RAPORU
+# =============================================================
+elif menu == "👁️ KİŞİ BAZLI DEVAM RAPORU":
+    st.header("👁️ KİŞİ BAZLI DEVAM RAPORU")
+    df_all = get_all_interns()
+
+    if df_all.empty:
+        st.warning("SİSTEMDE KAYITLI STAJYER BULUNAMADI.")
+    else:
+        col_f1, col_f2, col_f3 = st.columns([2, 1, 1])
+        with col_f1:
+            secim = st.selectbox("STAJYER SEÇİN (VEYA TÜMÜ)", ["— TÜMÜ —"] + df_all['ad_soyad'].tolist())
+        with col_f2:
+            r_bas = st.date_input("BAŞLANGIÇ", datetime(datetime.now().year, 1, 1).date(), key="r_bas")
+        with col_f3:
+            r_bit = st.date_input("BİTİŞ", datetime.now().date(), key="r_bit")
+
+        if r_bit < r_bas:
+            st.error("BİTİŞ TARİHİ BAŞLANGIÇTAN ÖNCE OLAMAZ!")
+            st.stop()
+
+        tatiller = get_resmi_tatiller(r_bas.year)
+        if r_bas.year != r_bit.year:
+            tatiller += get_resmi_tatiller(r_bit.year)
+
+        filtre_df = df_all if secim == "— TÜMÜ —" else df_all[df_all['ad_soyad'] == secim]
+        istat_listesi = []
+        for _, row in filtre_df.iterrows():
+            ist = stajyer_istatistik(row, r_bas, r_bit, tatiller)
+            ist["AD SOYAD"] = row['ad_soyad']
+            ist["GEMİ"]    = row['gemi']
+            ist["BÖLÜM"]   = row['bolum']
+            ist["SİCİL"]   = row.get('sicil_no', '')
+            istat_listesi.append(ist)
+
+        if secim != "— TÜMÜ —" and len(istat_listesi) == 1:
+            # TEK KİŞİ: detaylı kart göster
+            ist = istat_listesi[0]
+            st.subheader(f"📋 {secim} — DETAY RAPOR")
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("TOPLAM STAJ GÜNÜ",    ist["toplam_staj_gunu"])
+            m2.metric("DEVAM GÜNÜ",          ist["devam_gunu"])
+            m3.metric("RAPORLU",             ist["raporlu_gun"])
+            m4.metric("RAPORSUZ DEVAMSIZLIK",ist["raporsuz_gun"])
+            m5.metric("DEVAM ORANI",         f"%{ist['devam_orani']}")
+
+            st.progress(int(ist["devam_orani"]))
+
+            # İzin takvimi
+            izinler_kisi = get_intern_leaves(int(df_all[df_all['ad_soyad'] == secim]['id'].values[0]))
+            if not izinler_kisi.empty:
+                st.subheader("📅 İZİN GEÇMİŞİ")
+                izinler_kisi['SÜRE (GÜN)'] = (
+                    pd.to_datetime(izinler_kisi['izin_bitis']) -
+                    pd.to_datetime(izinler_kisi['izin_baslangic'])
+                ).dt.days + 1
+                st.dataframe(izinler_kisi[['izin_baslangic','izin_bitis','izin_tipi','SÜRE (GÜN)']].rename(columns={
+                    'izin_baslangic': 'BAŞLANGIÇ',
+                    'izin_bitis': 'BİTİŞ',
+                    'izin_tipi': 'TİP'
+                }), use_container_width=True, hide_index=True)
+        else:
+            # TÜMÜ: karşılaştırma tablosu + grafik
+            istat_df = pd.DataFrame(istat_listesi)[[
+                "SİCİL","AD SOYAD","GEMİ","BÖLÜM",
+                "toplam_staj_gunu","devam_gunu","raporlu_gun","raporsuz_gun","devam_orani"
+            ]].rename(columns={
+                "toplam_staj_gunu": "TOPLAM GÜN",
+                "devam_gunu":       "DEVAM",
+                "raporlu_gun":      "RAPORLU",
+                "raporsuz_gun":     "RAPORSUZ",
+                "devam_orani":      "DEVAM %",
+            })
+
+            st.dataframe(istat_df.style.background_gradient(
+                subset=["DEVAM %"], cmap="RdYlGn", vmin=0, vmax=100
+            ), use_container_width=True, hide_index=True)
+
+            col_g1, col_g2 = st.columns(2)
+            with col_g1:
+                fig_bar = px.bar(
+                    istat_df, x="AD SOYAD", y=["DEVAM","RAPORLU","RAPORSUZ"],
+                    title="📊 KİŞİ BAZLI DEVAM KARŞILAŞTIRMASI",
+                    barmode="stack", color_discrete_map={
+                        "DEVAM": "#2ecc71", "RAPORLU": "#f39c12", "RAPORSUZ": "#e74c3c"
+                    }
+                )
+                st.plotly_chart(fig_bar, use_container_width=True)
+            with col_g2:
+                fig_oran = px.bar(
+                    istat_df.sort_values("DEVAM %"),
+                    x="DEVAM %", y="AD SOYAD",
+                    orientation='h',
+                    title="📈 DEVAM ORANLARI (%)",
+                    color="DEVAM %",
+                    color_continuous_scale="RdYlGn",
+                    range_color=[0, 100]
+                )
+                fig_oran.add_vline(x=80, line_dash="dash", line_color="navy",
+                                   annotation_text="80% EŞİĞİ")
+                st.plotly_chart(fig_oran, use_container_width=True)
+
+            # Excel indirme
+            out2 = io.BytesIO()
+            with pd.ExcelWriter(out2, engine='xlsxwriter') as writer:
+                istat_df.to_excel(writer, index=False, sheet_name='DEVAM_RAPORU')
+            st.download_button("📥 RAPORU EXCEL OLARAK İNDİR",
+                               data=out2.getvalue(),
+                               file_name=f"DEVAM_RAPORU_{r_bas}_{r_bit}.xlsx")
+
+# =============================================================
+# 6. GELİŞMİŞ FİLTRELEME
+# =============================================================
+elif menu == "🔍 GELİŞMİŞ FİLTRELEME":
+    st.header("🔍 GELİŞMİŞ FİLTRELEME VE ARAMA")
+    df_all = get_all_interns()
+
+    if df_all.empty:
+        st.warning("SİSTEMDE KAYITLI STAJYER BULUNAMADI.")
+    else:
+        with st.expander("🎛️ FİLTRELER", expanded=True):
+            fc1, fc2, fc3, fc4 = st.columns(4)
+            with fc1:
+                gemiler     = ["TÜMÜ"] + sorted(df_all['gemi'].dropna().unique().tolist())
+                f_gemi      = st.selectbox("GEMİ", gemiler)
+            with fc2:
+                bolumler    = ["TÜMÜ"] + sorted(df_all['bolum'].dropna().unique().tolist())
+                f_bolum     = st.selectbox("BÖLÜM", bolumler)
+            with fc3:
+                gun_gruplari = ["TÜMÜ"] + sorted(df_all['gun_grubu'].dropna().unique().tolist())
+                f_gun_grubu  = st.selectbox("GÜN GRUBU", gun_gruplari)
+            with fc4:
+                f_ad = st.text_input("AD SOYAD ARA")
+
+        bugun = datetime.now().date()
+        df_all['baslangic'] = pd.to_datetime(df_all['baslangic']).dt.date
+        df_all['bitis']     = pd.to_datetime(df_all['bitis']).dt.date
+        df_all['DURUM'] = df_all['bitis'].apply(
+            lambda b: "✅ AKTİF" if pd.notna(b) and b >= bugun else "⏹️ TAMAMLANDI"
+        )
+
+        sonuc = df_all.copy()
+        if f_gemi     != "TÜMÜ":   sonuc = sonuc[sonuc['gemi']     == f_gemi]
+        if f_bolum    != "TÜMÜ":   sonuc = sonuc[sonuc['bolum']    == f_bolum]
+        if f_gun_grubu!= "TÜMÜ":   sonuc = sonuc[sonuc['gun_grubu']== f_gun_grubu]
+        if f_ad.strip():           sonuc = sonuc[sonuc['ad_soyad'].str.contains(f_ad.upper(), na=False)]
+
+        # Özet metrikler
+        sm1, sm2, sm3, sm4 = st.columns(4)
+        sm1.metric("SONUÇ SAYISI",    len(sonuc))
+        sm2.metric("AKTİF",          len(sonuc[sonuc['DURUM'] == "✅ AKTİF"]))
+        sm3.metric("TAMAMLANDI",     len(sonuc[sonuc['DURUM'] == "⏹️ TAMAMLANDI"]))
+        aktif_gemiler = sonuc['gemi'].nunique()
+        sm4.metric("GEMİ SAYISI",    aktif_gemiler)
+
+        st.divider()
+
+        if sonuc.empty:
+            st.info("FİLTREYE UYAN KAYIT BULUNAMADI.")
+        else:
+            goster_kolonlar = ['sicil_no','ad_soyad','okul','gemi','bolum',
+                               'telefon','baslangic','bitis','gun_grubu','DURUM','notlar']
+            goster_kolonlar = [k for k in goster_kolonlar if k in sonuc.columns]
+            st.dataframe(
+                sonuc[goster_kolonlar].rename(columns={
+                    'sicil_no':'SİCİL', 'ad_soyad':'AD SOYAD', 'okul':'OKUL',
+                    'gemi':'GEMİ', 'bolum':'BÖLÜM', 'telefon':'TELEFON',
+                    'baslangic':'BAŞLANGIÇ', 'bitis':'BİTİŞ',
+                    'gun_grubu':'GÜN GRUBU', 'notlar':'NOTLAR'
+                }),
+                use_container_width=True, hide_index=True
+            )
+
+            col_g1, col_g2 = st.columns(2)
+            with col_g1:
+                gemi_dag = sonuc['gemi'].value_counts().reset_index()
+                gemi_dag.columns = ['GEMİ','SAYI']
+                st.plotly_chart(
+                    px.bar(gemi_dag, x='GEMİ', y='SAYI',
+                           title="🚢 SONUÇLARDA GEMİ DAĞILIMI",
+                           color='SAYI', color_continuous_scale='Blues'),
+                    use_container_width=True
+                )
+            with col_g2:
+                durum_dag = sonuc['DURUM'].value_counts().reset_index()
+                durum_dag.columns = ['DURUM','SAYI']
+                st.plotly_chart(
+                    px.pie(durum_dag, values='SAYI', names='DURUM',
+                           title="📊 AKTİF / TAMAMLANDI",
+                           color_discrete_map={"✅ AKTİF":"#2ecc71","⏹️ TAMAMLANDI":"#bdc3c7"},
+                           hole=0.4),
+                    use_container_width=True
+                )
+
+            out3 = io.BytesIO()
+            with pd.ExcelWriter(out3, engine='xlsxwriter') as writer:
+                sonuc[goster_kolonlar].to_excel(writer, index=False, sheet_name='FİLTRELİ_LİSTE')
+            st.download_button("📥 FİLTRELİ LİSTEYİ EXCEL OLARAK İNDİR",
+                               data=out3.getvalue(),
+                               file_name="FILTRELI_LISTE.xlsx")
