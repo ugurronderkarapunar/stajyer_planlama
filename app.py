@@ -21,15 +21,13 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # --- VERİTABANI YÖNETİMİ ---
-# FIX 1: Veritabanı dosyası her zaman script ile aynı klasörde saklanır → veri kaybolmaz
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stajyer_takip_sistemi.db')
 
-@st.cache_resource  # FIX 1: Bağlantı uygulama boyunca tek sefer oluşturulur → veri kaybolmaz
+@st.cache_resource
 def init_db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     c = conn.cursor()
 
-    # Ana tablo: sicil_no ve notlar eklendi (FIX 2 & 4)
     c.execute('''CREATE TABLE IF NOT EXISTS stajyerler
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   sicil_no TEXT,
@@ -43,7 +41,6 @@ def init_db():
                   bolum TEXT,
                   notlar TEXT)''')
 
-    # İzin tablosu: izin_baslangic + izin_bitis eklendi (FIX 3)
     c.execute('''CREATE TABLE IF NOT EXISTS izinler
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   stajyer_id INTEGER,
@@ -52,16 +49,13 @@ def init_db():
                   izin_tipi TEXT,
                   FOREIGN KEY(stajyer_id) REFERENCES stajyerler(id))''')
 
-    # Mevcut veritabanı için sütun migrasyonu (eski kurulumlar bozulmasın)
     mevcut_kolonlar = [r[1] for r in c.execute("PRAGMA table_info(stajyerler)").fetchall()]
     for kolon, tip in [("sicil_no", "TEXT"), ("notlar", "TEXT")]:
         if kolon not in mevcut_kolonlar:
             c.execute(f"ALTER TABLE stajyerler ADD COLUMN {kolon} {tip}")
 
-    # İzin tablosu migrasyonu: eski izin_tarihi sütununu yeni yapıya taşı
     izin_kolonlar = [r[1] for r in c.execute("PRAGMA table_info(izinler)").fetchall()]
     if "izin_tarihi" in izin_kolonlar:
-        # SQLite sütun yeniden adlandırmayı desteklemez → tabloyu yeniden oluştur
         c.execute('''CREATE TABLE IF NOT EXISTS izinler_yeni
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
                       stajyer_id INTEGER,
@@ -110,7 +104,6 @@ def get_resmi_tatiller(yil):
     return tatiller
 
 def izin_var_mi(leaves_df, d_str):
-    """Verilen tarih herhangi bir izin aralığına denk geliyor mu?"""
     for _, row in leaves_df.iterrows():
         bas = str(row['izin_baslangic'])
         bit = str(row['izin_bitis']) if pd.notna(row['izin_bitis']) else bas
@@ -120,7 +113,6 @@ def izin_var_mi(leaves_df, d_str):
 
 
 def stajyer_istatistik(row, baslangic_dt, bitis_dt, tatiller_listesi):
-    """Bir stajyer icin verilen tarih araliginda devam istatistiklerini hesaplar."""
     gunler_range = pd.date_range(baslangic_dt, bitis_dt)
     leaves = get_intern_leaves(row['id'])
     toplam_staj_gunu = 0
@@ -131,16 +123,19 @@ def stajyer_istatistik(row, baslangic_dt, bitis_dt, tatiller_listesi):
     for d in gunler_range:
         d_str  = d.strftime('%Y-%m-%d')
         gun_tr = TR_GUNLER[d.strftime('%A')]
-        is_tatil = (gun_tr in ["CUMARTESI", "PAZAR"]) or (d_str in tatiller_listesi)
+        is_tatil = (gun_tr in ["CUMARTESİ", "PAZAR"]) or (d_str in tatiller_listesi)
         if is_tatil:
             continue
+
+        # FIX: Türkçe karakterler düzeltildi (İ, Ş, Ç)
         staj_gunu = (
-            gun_tr in ["PAZARTESI", "SALI", "CARSAMBA"]
-            if row['gun_grubu'] == "PAZARTESI-SALI-CARSAMBA"
-            else gun_tr in ["CARSAMBA", "PERSEMBE", "CUMA"]
+            gun_tr in ["PAZARTESİ", "SALI", "ÇARŞAMBA"]
+            if row['gun_grubu'] == "PAZARTESİ-SALI-ÇARŞAMBA"
+            else gun_tr in ["ÇARŞAMBA", "PERŞEMBE", "CUMA"]
         )
         if not staj_gunu:
             continue
+
         toplam_staj_gunu += 1
         izin_tipi = izin_var_mi(leaves, d_str)
         if izin_tipi == "RAPORLU":
@@ -207,7 +202,7 @@ elif menu == "👤 PERSONEL YÖNETİMİ":
     with st.expander("➕ YENİ STAJYER EKLE"):
         c1, c2 = st.columns(2)
         with c1:
-            sicil  = st.text_input("SİCİL NO")                          # FIX 2
+            sicil  = st.text_input("SİCİL NO")
             ad     = st.text_input("AD SOYAD").upper()
             okul   = st.text_input("OKUL").upper()
             gemi   = st.text_input("GEMİ ADI").upper()
@@ -218,7 +213,7 @@ elif menu == "👤 PERSONEL YÖNETİMİ":
             gunler = st.selectbox("STAJ GÜNLERİ",
                                   ["PAZARTESİ-SALI-ÇARŞAMBA", "ÇARŞAMBA-PERŞEMBE-CUMA"])
             bolum  = st.selectbox("BÖLÜM", ["MAKİNE", "GÜVERTE"])
-            notlar = st.text_area("NOTLAR (ÖĞRENCİ / GEMİ / OKUL BAZLI)", height=80)  # FIX 4
+            notlar = st.text_area("NOTLAR (ÖĞRENCİ / GEMİ / OKUL BAZLI)", height=80)
 
         if st.button("KAYDI TAMAMLA"):
             conn.execute(
@@ -258,9 +253,8 @@ elif menu == "📅 İZİN SİSTEMİ":
 
         with col_ekle:
             st.subheader("➕ İZİN EKLE")
-            i_bas  = st.date_input("İZİN BAŞLANGIÇ TARİHİ", key="izin_bas")   # FIX 3
-            i_bit  = st.date_input("İZİN BİTİŞ TARİHİ", key="izin_bit",       # FIX 3
-                                   value=i_bas)
+            i_bas  = st.date_input("İZİN BAŞLANGIÇ TARİHİ", key="izin_bas")
+            i_bit  = st.date_input("İZİN BİTİŞ TARİHİ", key="izin_bit", value=i_bas)
             i_tip  = st.radio("DURUM", ["RAPORLU", "RAPORSUZ DEVAMSIZLIK"], key="yeni_izin_tip")
 
             if st.button("İZİNİ KAYDET"):
@@ -351,7 +345,7 @@ elif menu == "📑 PUANTAJ VE EXCEL":
                         if row['gun_grubu'] == "PAZARTESİ-SALI-ÇARŞAMBA"
                         else gun_tr in ["ÇARŞAMBA", "PERŞEMBE", "CUMA"]
                     )
-                    izin_tipi = izin_var_mi(leaves, d_str)  # FIX 3: aralık kontrolü
+                    izin_tipi = izin_var_mi(leaves, d_str)
 
                     if izin_tipi:
                         satir[d.day] = izin_tipi
@@ -424,7 +418,6 @@ elif menu == "👁️ KİŞİ BAZLI DEVAM RAPORU":
             istat_listesi.append(ist)
 
         if secim != "— TÜMÜ —" and len(istat_listesi) == 1:
-            # TEK KİŞİ: detaylı kart göster
             ist = istat_listesi[0]
             st.subheader(f"📋 {secim} — DETAY RAPOR")
             m1, m2, m3, m4, m5 = st.columns(5)
@@ -436,7 +429,6 @@ elif menu == "👁️ KİŞİ BAZLI DEVAM RAPORU":
 
             st.progress(int(ist["devam_orani"]))
 
-            # İzin takvimi
             izinler_kisi = get_intern_leaves(int(df_all[df_all['ad_soyad'] == secim]['id'].values[0]))
             if not izinler_kisi.empty:
                 st.subheader("📅 İZİN GEÇMİŞİ")
@@ -450,7 +442,6 @@ elif menu == "👁️ KİŞİ BAZLI DEVAM RAPORU":
                     'izin_tipi': 'TİP'
                 }), use_container_width=True, hide_index=True)
         else:
-            # TÜMÜ: karşılaştırma tablosu + grafik
             istat_df = pd.DataFrame(istat_listesi)[[
                 "SİCİL","AD SOYAD","GEMİ","BÖLÜM",
                 "toplam_staj_gunu","devam_gunu","raporlu_gun","raporsuz_gun","devam_orani"
@@ -462,9 +453,24 @@ elif menu == "👁️ KİŞİ BAZLI DEVAM RAPORU":
                 "devam_orani":      "DEVAM %",
             })
 
-            st.dataframe(istat_df.style.background_gradient(
-                subset=["DEVAM %"], cmap="RdYlGn", vmin=0, vmax=100
-            ), use_container_width=True, hide_index=True)
+            # FIX: background_gradient (matplotlib gerektirir) kaldırıldı
+            # Devam oranını görsel olarak ifade etmek için Plotly kullanılıyor
+            st.dataframe(istat_df, use_container_width=True, hide_index=True)
+
+            # Devam % renk göstergesi ayrı bir bar chart ile
+            fig_oran_tablo = px.bar(
+                istat_df.sort_values("DEVAM %", ascending=False),
+                x="AD SOYAD", y="DEVAM %",
+                title="📊 DEVAM ORANLARI — RENK SKALASI",
+                color="DEVAM %",
+                color_continuous_scale="RdYlGn",
+                range_color=[0, 100],
+                text="DEVAM %"
+            )
+            fig_oran_tablo.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+            fig_oran_tablo.add_hline(y=80, line_dash="dash", line_color="navy",
+                                     annotation_text="80% EŞİĞİ")
+            st.plotly_chart(fig_oran_tablo, use_container_width=True)
 
             col_g1, col_g2 = st.columns(2)
             with col_g1:
@@ -490,7 +496,6 @@ elif menu == "👁️ KİŞİ BAZLI DEVAM RAPORU":
                                    annotation_text="80% EŞİĞİ")
                 st.plotly_chart(fig_oran, use_container_width=True)
 
-            # Excel indirme
             out2 = io.BytesIO()
             with pd.ExcelWriter(out2, engine='xlsxwriter') as writer:
                 istat_df.to_excel(writer, index=False, sheet_name='DEVAM_RAPORU')
@@ -535,7 +540,6 @@ elif menu == "🔍 GELİŞMİŞ FİLTRELEME":
         if f_gun_grubu!= "TÜMÜ":   sonuc = sonuc[sonuc['gun_grubu']== f_gun_grubu]
         if f_ad.strip():           sonuc = sonuc[sonuc['ad_soyad'].str.contains(f_ad.upper(), na=False)]
 
-        # Özet metrikler
         sm1, sm2, sm3, sm4 = st.columns(4)
         sm1.metric("SONUÇ SAYISI",    len(sonuc))
         sm2.metric("AKTİF",          len(sonuc[sonuc['DURUM'] == "✅ AKTİF"]))
