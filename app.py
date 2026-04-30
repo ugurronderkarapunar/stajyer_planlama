@@ -1,594 +1,916 @@
+"""
+=========================================================
+  Stajyer Takip ve Puantaj Yönetim Sistemi
+  Versiyon: 1.0
+=========================================================
+"""
+
 import streamlit as st
 import pandas as pd
-import sqlite3
-from datetime import datetime, timedelta
-import io
-import plotly.express as px
-import os
+from sqlalchemy import create_engine, text, MetaData, Table, Column, Integer, String, ForeignKey
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
+import holidays as holidays_lib
+from datetime import date, timedelta
+import calendar
+from io import BytesIO
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
-# --- SAYFA AYARLARI ---
-st.set_page_config(page_title="STAJYER PLANLAMA VE YÖNETİM SİSTEMİ", layout="wide")
+# ══════════════════════════════════════════════════════
+#  SAYFA YAPILANDIRMASI
+# ══════════════════════════════════════════════════════
+st.set_page_config(
+    page_title="Stajyer Takip Sistemi",
+    page_icon="🚢",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-st.markdown("""
-    <style>
-    .main { background-color: #f8f9fa; }
-    h1, h2, h3, h4, label, .stButton>button, .stMarkdown, p, span, .stMetric { 
-        text-transform: uppercase !important; 
-        font-weight: bold !important;
-    }
-    .stDataFrame, .stTable { border-radius: 10px; border: 1px solid #e0e0e0; }
-    </style>
-    """, unsafe_allow_html=True)
+# ══════════════════════════════════════════════════════
+#  SABİTLER
+# ══════════════════════════════════════════════════════
+PERIYOT_OPTIONS = [
+    "Hafta İçi Her Gün",
+    "Pazartesi-Salı-Çarşamba",
+    "Çarşamba-Perşembe-Cuma",
+]
 
-# --- VERİTABANI YÖNETİMİ ---
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stajyer_takip_sistemi.db')
+BOLUM_OPTIONS = ["Makineci", "Güverte"]
+IZIN_TURU_OPTIONS = ["Raporlu", "Raporsuz"]
 
-@st.cache_resource
-def init_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-
-    c.execute('''CREATE TABLE IF NOT EXISTS stajyerler
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  sicil_no TEXT,
-                  ad_soyad TEXT,
-                  okul TEXT,
-                  gemi TEXT,
-                  telefon TEXT,
-                  baslangic DATE,
-                  bitis DATE,
-                  gun_grubu TEXT,
-                  bolum TEXT,
-                  notlar TEXT)''')
-
-    c.execute('''CREATE TABLE IF NOT EXISTS izinler
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  stajyer_id INTEGER,
-                  izin_baslangic DATE,
-                  izin_bitis DATE,
-                  izin_tipi TEXT,
-                  FOREIGN KEY(stajyer_id) REFERENCES stajyerler(id))''')
-
-    mevcut_kolonlar = [r[1] for r in c.execute("PRAGMA table_info(stajyerler)").fetchall()]
-    for kolon, tip in [("sicil_no", "TEXT"), ("notlar", "TEXT")]:
-        if kolon not in mevcut_kolonlar:
-            c.execute(f"ALTER TABLE stajyerler ADD COLUMN {kolon} {tip}")
-
-    izin_kolonlar = [r[1] for r in c.execute("PRAGMA table_info(izinler)").fetchall()]
-    if "izin_tarihi" in izin_kolonlar:
-        c.execute('''CREATE TABLE IF NOT EXISTS izinler_yeni
-                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                      stajyer_id INTEGER,
-                      izin_baslangic DATE,
-                      izin_bitis DATE,
-                      izin_tipi TEXT,
-                      FOREIGN KEY(stajyer_id) REFERENCES stajyerler(id))''')
-        c.execute('''INSERT INTO izinler_yeni (id, stajyer_id, izin_baslangic, izin_bitis, izin_tipi)
-                     SELECT id, stajyer_id, izin_tarihi, izin_tarihi, izin_tipi FROM izinler''')
-        c.execute("DROP TABLE izinler")
-        c.execute("ALTER TABLE izinler_yeni RENAME TO izinler")
-    elif "izin_bitis" not in izin_kolonlar:
-        c.execute("ALTER TABLE izinler ADD COLUMN izin_bitis DATE")
-        c.execute("UPDATE izinler SET izin_bitis = izin_baslangic WHERE izin_bitis IS NULL")
-
-    conn.commit()
-    return conn
-
-conn = init_db()
-
-# --- YARDIMCI FONKSİYONLAR ---
-def get_all_interns():
-    return pd.read_sql("SELECT * FROM stajyerler", conn)
-
-def get_intern_leaves(intern_id):
-    return pd.read_sql(
-        "SELECT id, izin_baslangic, izin_bitis, izin_tipi FROM izinler WHERE stajyer_id = ?",
-        conn, params=(intern_id,)
-    )
-
-TR_GUNLER = {
-    'Monday': 'PAZARTESİ', 'Tuesday': 'SALI', 'Wednesday': 'ÇARŞAMBA',
-    'Thursday': 'PERŞEMBE', 'Friday': 'CUMA', 'Saturday': 'CUMARTESİ', 'Sunday': 'PAZAR'
+# Hafta içi gün numaraları (0=Pazartesi … 6=Pazar)
+PERIYOT_DAYS: dict[str, list[int]] = {
+    "Hafta İçi Her Gün": [0, 1, 2, 3, 4],
+    "Pazartesi-Salı-Çarşamba": [0, 1, 2],
+    "Çarşamba-Perşembe-Cuma": [2, 3, 4],
 }
 
-def get_resmi_tatiller(yil):
-    tatiller = [
-        f"{yil}-01-01", f"{yil}-04-23", f"{yil}-05-01",
-        f"{yil}-05-19", f"{yil}-07-15", f"{yil}-08-30", f"{yil}-10-29"
-    ]
-    if yil == 2026:
-        tatiller.extend([
-            "2026-03-19", "2026-03-20", "2026-03-21", "2026-03-22",
-            "2026-05-26", "2026-05-27", "2026-05-28", "2026-05-29", "2026-05-30"
-        ])
-    return tatiller
+AY_ADLARI = [
+    "Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran",
+    "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık",
+]
 
-def izin_var_mi(leaves_df, d_str):
-    for _, row in leaves_df.iterrows():
-        bas = str(row['izin_baslangic'])
-        bit = str(row['izin_bitis']) if pd.notna(row['izin_bitis']) else bas
-        if bas <= d_str <= bit:
-            return row['izin_tipi']
-    return None
+GUN_ADLARI = ["Pzt", "Sal", "Çar", "Per", "Cum", "Cmt", "Paz"]
+
+# ══════════════════════════════════════════════════════
+#  VERİTABANI — SİNGLETON BAĞLANTI
+# ══════════════════════════════════════════════════════
+
+@st.cache_resource(show_spinner="Veritabanına bağlanılıyor…")
+def get_engine():
+    """
+    Önce st.secrets içindeki DATABASE_URL'yi dener (Supabase / PostgreSQL).
+    Bulunamazsa yerel SQLite'a düşer.
+    """
+    try:
+        db_url = st.secrets["DATABASE_URL"]
+    except (KeyError, FileNotFoundError):
+        db_url = "sqlite:///./stajyer_takip.db"
+
+    connect_args = {"check_same_thread": False} if "sqlite" in str(db_url) else {}
+    engine = create_engine(db_url, connect_args=connect_args, pool_pre_ping=True)
+    return engine
 
 
-def stajyer_istatistik(row, baslangic_dt, bitis_dt, tatiller_listesi):
-    gunler_range = pd.date_range(baslangic_dt, bitis_dt)
-    leaves = get_intern_leaves(row['id'])
-    toplam_staj_gunu = 0
-    devam_gunu = 0
-    raporlu_gun = 0
-    raporsuz_gun = 0
+@st.cache_resource
+def get_metadata():
+    """SQLAlchemy tablo meta-verisini döndürür (diyalekt-bağımsız)."""
+    meta = MetaData()
 
-    for d in gunler_range:
-        d_str  = d.strftime('%Y-%m-%d')
-        gun_tr = TR_GUNLER[d.strftime('%A')]
-        is_tatil = (gun_tr in ["CUMARTESİ", "PAZAR"]) or (d_str in tatiller_listesi)
-        if is_tatil:
-            continue
+    Table(
+        "stajyerler", meta,
+        Column("id",                Integer, primary_key=True, autoincrement=True),
+        Column("ad",                String(100), nullable=False),
+        Column("soyad",             String(100), nullable=False),
+        Column("okul",              String(200)),
+        Column("telefon",           String(30)),
+        Column("sicil_no",          String(50),  unique=True),
+        Column("staj_gemisi",       String(100)),
+        Column("bolum",             String(50)),
+        Column("calisma_periyodu",  String(100)),
+        extend_existing=True,
+    )
 
-        # FIX: Türkçe karakterler düzeltildi (İ, Ş, Ç)
-        staj_gunu = (
-            gun_tr in ["PAZARTESİ", "SALI", "ÇARŞAMBA"]
-            if row['gun_grubu'] == "PAZARTESİ-SALI-ÇARŞAMBA"
-            else gun_tr in ["ÇARŞAMBA", "PERŞEMBE", "CUMA"]
+    Table(
+        "izinler", meta,
+        Column("id",                Integer, primary_key=True, autoincrement=True),
+        Column("stajyer_id",        Integer, ForeignKey("stajyerler.id", ondelete="CASCADE")),
+        Column("baslangic_tarihi",  String(20), nullable=False),
+        Column("bitis_tarihi",      String(20), nullable=False),
+        Column("izin_turu",         String(50)),
+        extend_existing=True,
+    )
+
+    return meta
+
+
+def init_db():
+    """Tablolar yoksa oluşturur."""
+    try:
+        meta = get_metadata()
+        meta.create_all(get_engine())
+    except SQLAlchemyError as exc:
+        st.error(f"Veritabanı başlatılamadı: {exc}")
+        st.stop()
+
+
+# ══════════════════════════════════════════════════════
+#  VERİ ERİŞİM FONKSİYONLARI
+# ══════════════════════════════════════════════════════
+
+def get_all_stajyerler() -> pd.DataFrame:
+    with get_engine().connect() as conn:
+        result = conn.execute(
+            text("SELECT * FROM stajyerler ORDER BY staj_gemisi, soyad, ad")
         )
-        if not staj_gunu:
-            continue
+        rows = result.fetchall()
+        return pd.DataFrame(rows, columns=list(result.keys())) if rows else pd.DataFrame()
 
-        toplam_staj_gunu += 1
-        izin_tipi = izin_var_mi(leaves, d_str)
-        if izin_tipi == "RAPORLU":
-            raporlu_gun += 1
-        elif izin_tipi == "RAPORSUZ DEVAMSIZLIK":
-            raporsuz_gun += 1
+
+def add_stajyer(data: dict) -> None:
+    with get_engine().connect() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO stajyerler
+                    (ad, soyad, okul, telefon, sicil_no, staj_gemisi, bolum, calisma_periyodu)
+                VALUES
+                    (:ad, :soyad, :okul, :telefon, :sicil_no, :staj_gemisi, :bolum, :calisma_periyodu)
+            """),
+            data,
+        )
+        conn.commit()
+
+
+def delete_stajyer(stajyer_id: int) -> None:
+    with get_engine().connect() as conn:
+        conn.execute(text("DELETE FROM izinler   WHERE stajyer_id = :sid"), {"sid": stajyer_id})
+        conn.execute(text("DELETE FROM stajyerler WHERE id = :sid"),         {"sid": stajyer_id})
+        conn.commit()
+
+
+def get_izinler_for_month(stajyer_id: int, year: int, month: int) -> pd.DataFrame:
+    num_days = calendar.monthrange(year, month)[1]
+    start    = f"{year}-{month:02d}-01"
+    end      = f"{year}-{month:02d}-{num_days:02d}"
+    with get_engine().connect() as conn:
+        result = conn.execute(
+            text("""
+                SELECT * FROM izinler
+                WHERE stajyer_id       = :sid
+                  AND bitis_tarihi    >= :start
+                  AND baslangic_tarihi<= :end
+            """),
+            {"sid": stajyer_id, "start": start, "end": end},
+        )
+        rows = result.fetchall()
+        return pd.DataFrame(rows, columns=list(result.keys())) if rows else pd.DataFrame()
+
+
+def get_all_izinler() -> pd.DataFrame:
+    with get_engine().connect() as conn:
+        result = conn.execute(
+            text("""
+                SELECT i.id, s.ad, s.soyad, s.staj_gemisi,
+                       i.baslangic_tarihi, i.bitis_tarihi, i.izin_turu
+                FROM izinler   i
+                JOIN stajyerler s ON i.stajyer_id = s.id
+                ORDER BY i.baslangic_tarihi DESC
+            """)
+        )
+        rows = result.fetchall()
+        return pd.DataFrame(rows, columns=list(result.keys())) if rows else pd.DataFrame()
+
+
+def add_izin(data: dict) -> None:
+    with get_engine().connect() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO izinler (stajyer_id, baslangic_tarihi, bitis_tarihi, izin_turu)
+                VALUES (:stajyer_id, :baslangic_tarihi, :bitis_tarihi, :izin_turu)
+            """),
+            data,
+        )
+        conn.commit()
+
+
+def delete_izin(izin_id: int) -> None:
+    with get_engine().connect() as conn:
+        conn.execute(text("DELETE FROM izinler WHERE id = :iid"), {"iid": izin_id})
+        conn.commit()
+
+
+# ══════════════════════════════════════════════════════
+#  İŞ MANTIĞI
+# ══════════════════════════════════════════════════════
+
+def get_tr_holidays(year: int) -> dict:
+    """Türkiye resmi tatillerini {date: isim} olarak döndürür."""
+    return dict(holidays_lib.country_holidays("TR", years=year))
+
+
+def get_day_status(
+    day_date: date,
+    periyot: str,
+    izinler_df: pd.DataFrame,
+    tr_holidays_dict: dict,
+) -> str:
+    """
+    Dönen değerler:
+      HAFTA SONU | TATİL | - | RAPORLU | RAPORSUZ DEVAMSIZLIK | 1
+    """
+    weekday   = day_date.weekday()
+    work_days = PERIYOT_DAYS.get(periyot, [0, 1, 2, 3, 4])
+
+    if weekday >= 5:
+        return "HAFTA SONU"
+
+    if day_date in tr_holidays_dict:
+        return "TATİL"
+
+    if weekday not in work_days:
+        return "-"
+
+    if not izinler_df.empty:
+        for _, izin in izinler_df.iterrows():
+            try:
+                start = date.fromisoformat(str(izin["baslangic_tarihi"])[:10])
+                end   = date.fromisoformat(str(izin["bitis_tarihi"])[:10])
+            except ValueError:
+                continue
+            if start <= day_date <= end:
+                return "RAPORLU" if str(izin["izin_turu"]) == "Raporlu" else "RAPORSUZ DEVAMSIZLIK"
+
+    return "1"
+
+
+def validate_leave_dates(
+    start_date: date, end_date: date, periyot: str
+) -> tuple[bool, list[str]]:
+    """
+    Dönüş:
+      (izin aralığında en az 1 çalışma günü var mı, çalışma dışı gün listesi)
+    """
+    work_days = PERIYOT_DAYS.get(periyot, [0, 1, 2, 3, 4])
+    has_work_day = False
+    non_work_days: list[str] = []
+    current = start_date
+    while current <= end_date:
+        if current.weekday() in work_days:
+            has_work_day = True
         else:
-            devam_gunu += 1
+            non_work_days.append(current.strftime("%d.%m.%Y"))
+        current += timedelta(days=1)
+    return has_work_day, non_work_days
 
-    oran = round(devam_gunu / toplam_staj_gunu * 100, 1) if toplam_staj_gunu > 0 else 0
-    return {
-        "toplam_staj_gunu": toplam_staj_gunu,
-        "devam_gunu": devam_gunu,
-        "raporlu_gun": raporlu_gun,
-        "raporsuz_gun": raporsuz_gun,
-        "devam_orani": oran,
+
+# ══════════════════════════════════════════════════════
+#  EXCEL EXPORT
+# ══════════════════════════════════════════════════════
+
+# Renk sabitleri
+C_HEADER   = "1F4E79"
+C_SUBHDR   = "2E75B6"
+C_WEEKEND  = "D0CECE"
+C_HOLIDAY  = "C00000"
+C_WORKDAY  = "70AD47"
+C_RAPORLU  = "FFD966"
+C_RAPORSUZ = "F4B183"
+C_NODAY    = "EDEDED"
+C_TOTAL    = "BDD7EE"
+C_WHITE    = "FFFFFF"
+
+
+def _fill(color: str) -> PatternFill:
+    return PatternFill("solid", fgColor=color)
+
+
+def _font(bold=False, color="000000", size=9) -> Font:
+    return Font(bold=bold, color=color, size=size)
+
+
+def _center() -> Alignment:
+    return Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+
+def _thin_border() -> Border:
+    s = Side(style="thin", color="BFBFBF")
+    return Border(left=s, right=s, top=s, bottom=s)
+
+
+def create_excel(year: int, month: int, stajyerler_df: pd.DataFrame) -> BytesIO:
+    wb  = openpyxl.Workbook()
+    ws  = wb.active
+    ws.title = f"{AY_ADLARI[month - 1]} {year}"
+
+    tr_hols  = get_tr_holidays(year)
+    num_days = calendar.monthrange(year, month)[1]
+
+    # ── Satır 1: Başlık ──────────────────────────────────────────────────────
+    ws.row_dimensions[1].height = 30
+    ws.row_dimensions[2].height = 22
+
+    static_cols  = ["Ad Soyad", "Gemi", "Bölüm", "Periyot"]
+    day_col_start = len(static_cols) + 1          # Excel sütun indisi (1-tabanlı)
+    total_col     = day_col_start + num_days
+
+    for ci, hdr in enumerate(static_cols, 1):
+        c = ws.cell(row=1, column=ci, value=hdr)
+        c.fill      = _fill(C_HEADER)
+        c.font      = _font(bold=True, color=C_WHITE, size=10)
+        c.alignment = _center()
+        c.border    = _thin_border()
+
+    for d in range(1, num_days + 1):
+        ci = day_col_start + d - 1
+        c  = ws.cell(row=1, column=ci, value=d)
+        c.fill      = _fill(C_HEADER)
+        c.font      = _font(bold=True, color=C_WHITE, size=9)
+        c.alignment = _center()
+        c.border    = _thin_border()
+
+    tc = ws.cell(row=1, column=total_col, value="Toplam\nGün")
+    tc.fill      = _fill(C_SUBHDR)
+    tc.font      = _font(bold=True, color=C_WHITE, size=10)
+    tc.alignment = _center()
+    tc.border    = _thin_border()
+
+    # ── Satır 2: Gün adları ──────────────────────────────────────────────────
+    for d in range(1, num_days + 1):
+        ci       = day_col_start + d - 1
+        day_date = date(year, month, d)
+        day_name = GUN_ADLARI[day_date.weekday()]
+        c        = ws.cell(row=2, column=ci, value=day_name)
+        c.alignment = _center()
+        c.border    = _thin_border()
+        if day_date.weekday() >= 5:
+            c.fill = _fill(C_WEEKEND)
+            c.font = _font(bold=True, color="595959", size=8)
+        elif day_date in tr_hols:
+            c.fill = _fill(C_HOLIDAY)
+            c.font = _font(bold=True, color=C_WHITE, size=8)
+        else:
+            c.font = _font(bold=True, size=8)
+
+    # ── Veri satırları ───────────────────────────────────────────────────────
+    for ri, (_, intern) in enumerate(stajyerler_df.iterrows(), 3):
+        ws.row_dimensions[ri].height = 18
+        static_vals = [
+            f"{intern['ad']} {intern['soyad']}",
+            intern["staj_gemisi"],
+            intern["bolum"],
+            intern["calisma_periyodu"],
+        ]
+        for ci, val in enumerate(static_vals, 1):
+            c = ws.cell(row=ri, column=ci, value=val)
+            c.alignment = _center()
+            c.border    = _thin_border()
+            c.font      = _font(size=9)
+
+        izinler_df = get_izinler_for_month(intern["id"], year, month)
+        total      = 0
+
+        for d in range(1, num_days + 1):
+            ci       = day_col_start + d - 1
+            day_date = date(year, month, d)
+            status   = get_day_status(day_date, intern["calisma_periyodu"], izinler_df, tr_hols)
+            c        = ws.cell(row=ri, column=ci)
+            c.alignment = _center()
+            c.border    = _thin_border()
+
+            match status:
+                case "HAFTA SONU":
+                    c.fill = _fill(C_WEEKEND)
+                    c.font = _font(color="999999", size=8)
+                case "TATİL":
+                    c.value = "TATİL"
+                    c.fill  = _fill(C_HOLIDAY)
+                    c.font  = _font(bold=True, color=C_WHITE, size=7)
+                case "-":
+                    c.fill = _fill(C_NODAY)
+                case "1":
+                    c.value = "1"
+                    c.fill  = _fill(C_WORKDAY)
+                    c.font  = _font(bold=True, color=C_WHITE, size=10)
+                    total  += 1
+                case "RAPORLU":
+                    c.value = "RPL"
+                    c.fill  = _fill(C_RAPORLU)
+                    c.font  = _font(bold=True, size=8)
+                case "RAPORSUZ DEVAMSIZLIK":
+                    c.value = "RPSSZ"
+                    c.fill  = _fill(C_RAPORSUZ)
+                    c.font  = _font(bold=True, size=8)
+
+        tc = ws.cell(row=ri, column=total_col, value=total)
+        tc.fill      = _fill(C_TOTAL)
+        tc.font      = _font(bold=True, size=10)
+        tc.alignment = _center()
+        tc.border    = _thin_border()
+
+    # ── Sütun genişlikleri ───────────────────────────────────────────────────
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["B"].width = 16
+    ws.column_dimensions["C"].width = 12
+    ws.column_dimensions["D"].width = 22
+    for d in range(1, num_days + 1):
+        ws.column_dimensions[get_column_letter(day_col_start + d - 1)].width = 5.5
+    ws.column_dimensions[get_column_letter(total_col)].width = 9
+
+    # ── Tatil açıklama satırı ─────────────────────────────────────────────────
+    last_data_row = 2 + len(stajyerler_df) + 2
+    ws.row_dimensions[last_data_row].height = 14
+    month_hols    = {d: n for d, n in tr_hols.items() if d.year == year and d.month == month}
+    legend_text   = "Resmi Tatiller: " + ", ".join(
+        f"{d.strftime('%d')} {n}" for d, n in sorted(month_hols.items())
+    ) if month_hols else "Bu ayda resmi tatil yok."
+    ws.cell(row=last_data_row, column=1, value=legend_text).font = _font(size=8, color="595959")
+
+    # Lejant
+    lejant_row = last_data_row + 1
+    ws.row_dimensions[lejant_row].height = 14
+    legends = [
+        ("1 → Çalışma günü", C_WORKDAY, C_WHITE),
+        ("RPL → Raporlu", C_RAPORLU, "000000"),
+        ("RPSSZ → Raporsuz devamsızlık", C_RAPORSUZ, "000000"),
+        ("TATİL → Resmi tatil", C_HOLIDAY, C_WHITE),
+    ]
+    for ci, (txt, bg, fg) in enumerate(legends, 1):
+        c = ws.cell(row=lejant_row, column=ci, value=txt)
+        c.fill = _fill(bg)
+        c.font = _font(color=fg, size=8)
+
+    # ── Dondur ────────────────────────────────────────────────────────────────
+    ws.freeze_panes = ws.cell(row=3, column=day_col_start)
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
+
+
+# ══════════════════════════════════════════════════════
+#  SAYFA: STAJYER KAYIT
+# ══════════════════════════════════════════════════════
+
+def page_kayit():
+    st.title("📋 Stajyer Kayıt")
+    st.caption("Yeni stajyer ekleyin veya mevcut kayıtları yönetin.")
+
+    # ─── Kayıt formu ──────────────────────────────────────────────────────────
+    with st.expander("➕ Yeni Stajyer Ekle", expanded=True):
+        with st.form("stajyer_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                ad              = st.text_input("Ad *")
+                soyad           = st.text_input("Soyad *")
+                okul            = st.text_input("Okul")
+                telefon         = st.text_input("Telefon")
+            with c2:
+                sicil_no        = st.text_input("Sicil No *")
+                staj_gemisi     = st.text_input("Staj Gemisi *")
+                bolum           = st.selectbox("Bölüm *", BOLUM_OPTIONS)
+                calisma_periyodu = st.selectbox("Çalışma Periyodu *", PERIYOT_OPTIONS)
+
+            kaydet = st.form_submit_button("💾 Kaydet", use_container_width=True, type="primary")
+
+        if kaydet:
+            if not all([ad.strip(), soyad.strip(), sicil_no.strip(), staj_gemisi.strip()]):
+                st.warning("⚠️ Yıldızlı alanlar zorunludur.")
+            else:
+                try:
+                    add_stajyer({
+                        "ad": ad.strip(), "soyad": soyad.strip(),
+                        "okul": okul.strip(), "telefon": telefon.strip(),
+                        "sicil_no": sicil_no.strip(), "staj_gemisi": staj_gemisi.strip(),
+                        "bolum": bolum, "calisma_periyodu": calisma_periyodu,
+                    })
+                    st.success(f"✅ **{ad} {soyad}** başarıyla kaydedildi!")
+                    st.rerun()
+                except IntegrityError:
+                    st.error("❌ Bu sicil numarası zaten kayıtlı.")
+                except SQLAlchemyError as exc:
+                    st.error(f"❌ Veritabanı hatası: {exc}")
+
+    # ─── Kayıt tablosu ────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("📌 Kayıtlı Stajyerler")
+
+    try:
+        df = get_all_stajyerler()
+    except SQLAlchemyError as exc:
+        st.error(f"Veriler yüklenemedi: {exc}")
+        return
+
+    if df.empty:
+        st.info("Henüz hiç stajyer kaydedilmemiş.")
+        return
+
+    # Arama
+    arama = st.text_input("🔍 Ara (ad, soyad, gemi, sicil)", placeholder="örn. Ahmet ya da Fırtına")
+    if arama:
+        mask = (
+            df["ad"].str.contains(arama, case=False, na=False) |
+            df["soyad"].str.contains(arama, case=False, na=False) |
+            df["staj_gemisi"].str.contains(arama, case=False, na=False) |
+            df["sicil_no"].str.contains(arama, case=False, na=False)
+        )
+        df = df[mask]
+
+    col_labels = {
+        "id": "ID", "ad": "Ad", "soyad": "Soyad", "okul": "Okul",
+        "telefon": "Telefon", "sicil_no": "Sicil No",
+        "staj_gemisi": "Gemi", "bolum": "Bölüm", "calisma_periyodu": "Periyot",
+    }
+    st.dataframe(
+        df.rename(columns=col_labels),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # Silme
+    with st.expander("🗑️ Stajyer Sil"):
+        sid_opts = {f"{r['ad']} {r['soyad']} (#{r['id']})": r["id"] for _, r in df.iterrows()}
+        if sid_opts:
+            sec = st.selectbox("Silmek istenen stajyer", list(sid_opts.keys()))
+            if st.button("🗑️ Sil", type="secondary"):
+                try:
+                    delete_stajyer(sid_opts[sec])
+                    st.success("Stajyer ve ilgili izin kayıtları silindi.")
+                    st.rerun()
+                except SQLAlchemyError as exc:
+                    st.error(f"Silme hatası: {exc}")
+
+
+# ══════════════════════════════════════════════════════
+#  SAYFA: GEMİ DASHBOARD
+# ══════════════════════════════════════════════════════
+
+def page_dashboard():
+    st.title("🚢 Gemi Dashboard")
+    st.caption("Gemilere göre stajyer dağılımını inceleyin, filtreleyin.")
+
+    try:
+        df = get_all_stajyerler()
+    except SQLAlchemyError as exc:
+        st.error(f"Veri yüklenemedi: {exc}")
+        return
+
+    if df.empty:
+        st.info("Henüz kayıtlı stajyer yok. Önce kayıt sayfasından ekleme yapın.")
+        return
+
+    # ─── Filtreler ────────────────────────────────────────────────────────────
+    fc1, fc2, fc3 = st.columns(3)
+    with fc1:
+        gemiler = ["Tümü"] + sorted(df["staj_gemisi"].dropna().unique().tolist())
+        sel_gemi = st.selectbox("Gemi", gemiler)
+    with fc2:
+        sel_bolum = st.selectbox("Bölüm", ["Tümü"] + BOLUM_OPTIONS)
+    with fc3:
+        sel_periyot = st.selectbox("Periyot", ["Tümü"] + PERIYOT_OPTIONS)
+
+    filtered = df.copy()
+    if sel_gemi    != "Tümü": filtered = filtered[filtered["staj_gemisi"]      == sel_gemi]
+    if sel_bolum   != "Tümü": filtered = filtered[filtered["bolum"]             == sel_bolum]
+    if sel_periyot != "Tümü": filtered = filtered[filtered["calisma_periyodu"] == sel_periyot]
+
+    # ─── Özet kartlar ─────────────────────────────────────────────────────────
+    st.divider()
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("🧑 Toplam Stajyer",  len(filtered))
+    m2.metric("⚙️ Makineci",        len(filtered[filtered["bolum"] == "Makineci"]))
+    m3.metric("⚓ Güverte",          len(filtered[filtered["bolum"] == "Güverte"]))
+    m4.metric("🚢 Aktif Gemi Sayısı", filtered["staj_gemisi"].nunique())
+
+    if filtered.empty:
+        st.warning("Seçilen filtrelere uygun stajyer bulunamadı.")
+        return
+
+    # ─── Gemi bazlı kart görünümü ─────────────────────────────────────────────
+    st.divider()
+    st.subheader("🛳️ Gemilere Göre Dağılım")
+
+    ship_stats = (
+        filtered
+        .groupby("staj_gemisi")
+        .apply(lambda x: pd.Series({
+            "Toplam":    len(x),
+            "Makineci":  (x["bolum"] == "Makineci").sum(),
+            "Güverte":   (x["bolum"] == "Güverte").sum(),
+        }), include_groups=False)
+        .reset_index()
+        .rename(columns={"staj_gemisi": "Gemi"})
+        .sort_values("Toplam", ascending=False)
+    )
+
+    for _, row in ship_stats.iterrows():
+        with st.expander(
+            f"🚢  **{row['Gemi']}**  —  Toplam: {int(row['Toplam'])} stajyer",
+            expanded=True,
+        ):
+            sc1, sc2, sc3 = st.columns(3)
+            sc1.metric("Toplam",   int(row["Toplam"]))
+            sc2.metric("Makineci", int(row["Makineci"]))
+            sc3.metric("Güverte",  int(row["Güverte"]))
+
+            ship_df = filtered[filtered["staj_gemisi"] == row["Gemi"]][
+                ["ad", "soyad", "bolum", "calisma_periyodu", "okul", "sicil_no"]
+            ].copy()
+            ship_df.columns = ["Ad", "Soyad", "Bölüm", "Periyot", "Okul", "Sicil No"]
+            st.dataframe(ship_df, use_container_width=True, hide_index=True)
+
+    # ─── Pasta grafikler ──────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("📊 Genel Dağılım Grafikleri")
+
+    gc1, gc2 = st.columns(2)
+    with gc1:
+        st.caption("**Bölüm Dağılımı**")
+        bolum_counts = filtered["bolum"].value_counts().reset_index()
+        bolum_counts.columns = ["Bölüm", "Sayı"]
+        st.bar_chart(bolum_counts.set_index("Bölüm"))
+    with gc2:
+        st.caption("**Periyot Dağılımı**")
+        periyot_counts = filtered["calisma_periyodu"].value_counts().reset_index()
+        periyot_counts.columns = ["Periyot", "Sayı"]
+        st.bar_chart(periyot_counts.set_index("Periyot"))
+
+
+# ══════════════════════════════════════════════════════
+#  SAYFA: İZİN GİRİŞİ
+# ══════════════════════════════════════════════════════
+
+def page_izin():
+    st.title("📅 İzin Girişi")
+    st.caption("Stajyer izinlerini kaydedin. Sistem otomatik çalışma günü kontrolü yapar.")
+
+    try:
+        df = get_all_stajyerler()
+    except SQLAlchemyError as exc:
+        st.error(f"Veri yüklenemedi: {exc}")
+        return
+
+    if df.empty:
+        st.warning("Önce stajyer kaydı yapınız.")
+        return
+
+    # ─── İzin formu ───────────────────────────────────────────────────────────
+    intern_opts = {
+        f"{r['ad']} {r['soyad']}  |  {r['staj_gemisi']}  |  #{r['id']}": r["id"]
+        for _, r in df.iterrows()
     }
 
-# --- SIDEBAR NAVİGASYON ---
-st.sidebar.title("⚓ NAVİGASYON")
-menu = st.sidebar.radio("SAYFA SEÇİNİZ:", [
-    "📊 DASHBOARD",
-    "👤 PERSONEL YÖNETİMİ",
-    "📅 İZİN SİSTEMİ",
-    "📑 PUANTAJ VE EXCEL",
-    "👁️ KİŞİ BAZLI DEVAM RAPORU",
-    "🔍 GELİŞMİŞ FİLTRELEME",
-])
+    with st.form("izin_form", clear_on_submit=True):
+        sec_intern = st.selectbox("Stajyer Seçin *", list(intern_opts.keys()))
 
-# =============================================================
-# 1. DASHBOARD
-# =============================================================
-if menu == "📊 DASHBOARD":
-    st.header("📈 GENEL DURUM VE ANALİZ")
-    df_stajyer = get_all_interns()
-    if not df_stajyer.empty:
-        col1, col2, col3 = st.columns([1, 2, 2])
-        with col1:
-            st.metric("TOPLAM STAJYER", len(df_stajyer))
-        with col2:
-            gemi_counts = df_stajyer['gemi'].value_counts().reset_index()
-            gemi_counts.columns = ['GEMİ', 'SAYI']
-            st.plotly_chart(
-                px.bar(gemi_counts, x='GEMİ', y='SAYI', title="🚢 GEMİ BAZLI DAĞILIM"),
-                use_container_width=True
-            )
-        with col3:
-            bolum_counts = df_stajyer['bolum'].value_counts().reset_index()
-            bolum_counts.columns = ['BÖLÜM', 'SAYI']
-            st.plotly_chart(
-                px.pie(bolum_counts, values='SAYI', names='BÖLÜM',
-                       title="🛠️ BÖLÜM DAĞILIMI", hole=0.3),
-                use_container_width=True
-            )
-    else:
-        st.info("HENÜZ STAJYER KAYDI BULUNMAMAKTADIR.")
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            bas_tarih = st.date_input("Başlangıç Tarihi *", value=date.today())
+        with fc2:
+            bit_tarih = st.date_input("Bitiş Tarihi *",    value=date.today())
+        with fc3:
+            izin_turu = st.selectbox("İzin Türü *", IZIN_TURU_OPTIONS)
 
-# =============================================================
-# 2. PERSONEL YÖNETİMİ
-# =============================================================
-elif menu == "👤 PERSONEL YÖNETİMİ":
-    st.header("👤 STAJYER KAYIT VE YÖNETİMİ")
+        kaydet = st.form_submit_button("💾 İzni Kaydet", use_container_width=True, type="primary")
 
-    with st.expander("➕ YENİ STAJYER EKLE"):
-        c1, c2 = st.columns(2)
-        with c1:
-            sicil  = st.text_input("SİCİL NO")
-            ad     = st.text_input("AD SOYAD").upper()
-            okul   = st.text_input("OKUL").upper()
-            gemi   = st.text_input("GEMİ ADI").upper()
-            tel    = st.text_input("TELEFON NUMARASI")
-        with c2:
-            bas    = st.date_input("STAJ BAŞLANGIÇ")
-            bit    = st.date_input("STAJ BİTİŞ")
-            gunler = st.selectbox("STAJ GÜNLERİ",
-                                  ["PAZARTESİ-SALI-ÇARŞAMBA", "ÇARŞAMBA-PERŞEMBE-CUMA"])
-            bolum  = st.selectbox("BÖLÜM", ["MAKİNE", "GÜVERTE"])
-            notlar = st.text_area("NOTLAR (ÖĞRENCİ / GEMİ / OKUL BAZLI)", height=80)
+    if kaydet:
+        if bit_tarih < bas_tarih:
+            st.error("❌ Bitiş tarihi, başlangıç tarihinden önce olamaz!")
+        else:
+            intern_id  = intern_opts[sec_intern]
+            intern_row = df[df["id"] == intern_id].iloc[0]
+            periyot    = intern_row["calisma_periyodu"]
 
-        if st.button("KAYDI TAMAMLA"):
-            conn.execute(
-                """INSERT INTO stajyerler
-                   (sicil_no, ad_soyad, okul, gemi, telefon, baslangic, bitis,
-                    gun_grubu, bolum, notlar)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (sicil, ad, okul, gemi, tel, bas, bit, gunler, bolum, notlar)
-            )
-            conn.commit()
-            st.success(f"{ad} EKLENDİ!")
-            st.rerun()
+            has_work, non_work = validate_leave_dates(bas_tarih, bit_tarih, periyot)
 
-    df = get_all_interns()
-    if not df.empty:
-        st.subheader("📝 PERSONEL LİSTESİNİ DÜZENLE / SİL")
-        edited_df = st.data_editor(df, num_rows="dynamic", key="main_editor", hide_index=True)
-        if st.button("🔄 TÜMÜNÜ GÜNCELLE"):
-            conn.execute("DELETE FROM stajyerler")
-            edited_df.to_sql('stajyerler', conn, if_exists='append', index=False)
-            conn.commit()
-            st.success("PERSONEL LİSTESİ GÜNCELLENDİ!")
-            st.rerun()
-
-# =============================================================
-# 3. İZİN SİSTEMİ
-# =============================================================
-elif menu == "📅 İZİN SİSTEMİ":
-    st.header("📅 İZİN YÖNETİMİ")
-    df = get_all_interns()
-
-    if not df.empty:
-        s_ad = st.selectbox("STAJYER SEÇİN", df['ad_soyad'].tolist())
-        s_id = int(df[df['ad_soyad'] == s_ad]['id'].values[0])
-
-        col_ekle, col_duzenle = st.columns([1, 2])
-
-        with col_ekle:
-            st.subheader("➕ İZİN EKLE")
-            i_bas  = st.date_input("İZİN BAŞLANGIÇ TARİHİ", key="izin_bas")
-            i_bit  = st.date_input("İZİN BİTİŞ TARİHİ", key="izin_bit", value=i_bas)
-            i_tip  = st.radio("DURUM", ["RAPORLU", "RAPORSUZ DEVAMSIZLIK"], key="yeni_izin_tip")
-
-            if st.button("İZİNİ KAYDET"):
-                if i_bit < i_bas:
-                    st.error("BİTİŞ TARİHİ BAŞLANGIÇTAN ÖNCE OLAMAZ!")
-                else:
-                    conn.execute(
-                        "INSERT INTO izinler (stajyer_id, izin_baslangic, izin_bitis, izin_tipi) VALUES (?,?,?,?)",
-                        (s_id, i_bas, i_bit, i_tip)
-                    )
-                    conn.commit()
-                    gun_sayisi = (i_bit - i_bas).days + 1
-                    st.success(f"İZİN KAYDEDİLDİ! ({gun_sayisi} GÜN)")
-                    st.rerun()
-
-        with col_duzenle:
-            st.subheader("📝 İZİN DÜZENLE / SİL")
-            iz_df = get_intern_leaves(s_id)
-
-            if not iz_df.empty:
-                edited_iz_df = st.data_editor(
-                    iz_df,
-                    column_order=("izin_baslangic", "izin_bitis", "izin_tipi"),
-                    num_rows="dynamic",
-                    key="izin_editor",
-                    use_container_width=True,
-                    hide_index=True
+            if not has_work:
+                st.warning(
+                    f"⚠️ **Uyarı:** Seçilen tarih aralığında ({bas_tarih.strftime('%d.%m.%Y')} — "
+                    f"{bit_tarih.strftime('%d.%m.%Y')}) bu stajyerin **çalışma günü bulunmamaktadır**.\n\n"
+                    f"Stajyerin periyodu: **{periyot}**\n\n"
+                    "Bu gün(ler) zaten stajyerin çalışma günü değil. İzin kaydı yapılmadı."
                 )
-
-                if st.button("🔄 DEĞİŞİKLİKLERİ KAYDET"):
-                    conn.execute("DELETE FROM izinler WHERE stajyer_id = ?", (s_id,))
-                    for _, row in edited_iz_df.iterrows():
-                        if pd.notna(row['izin_baslangic']):
-                            bit_tar = row['izin_bitis'] if pd.notna(row['izin_bitis']) else row['izin_baslangic']
-                            conn.execute(
-                                "INSERT INTO izinler (stajyer_id, izin_baslangic, izin_bitis, izin_tipi) VALUES (?,?,?,?)",
-                                (s_id, row['izin_baslangic'], bit_tar, row['izin_tipi'])
-                            )
-                    conn.commit()
-                    st.success("İZİN KAYITLARI GÜNCELLENDİ!")
-                    st.rerun()
-
-                st.caption("NOT: SATIRI SEÇİP 'DELETE' TUŞUYLA SİLEBİLİRSİNİZ.")
             else:
-                st.info("BU KİŞİYE AİT KAYITLI İZİN BULUNMAMAKTADIR.")
-    else:
-        st.warning("SİSTEMDE KAYITLI STAJYER BULUNAMADI.")
-
-# =============================================================
-# 4. PUANTAJ VE EXCEL
-# =============================================================
-elif menu == "📑 PUANTAJ VE EXCEL":
-    st.header("📑 AYLIK PUANTAJ VE TOPLAM DEVAM")
-    c1, c2 = st.columns(2)
-    ay  = c1.number_input("AY",  1, 12, datetime.now().month)
-    yil = c2.number_input("YIL", 2024, 2030, datetime.now().year)
-
-    df_st = get_all_interns()
-    if not df_st.empty:
-        bas_dt = datetime(yil, ay, 1)
-        bit_dt = (datetime(yil, ay + 1, 1) if ay < 12 else datetime(yil + 1, 1, 1)) - timedelta(days=1)
-        gunler_range = pd.date_range(bas_dt, bit_dt)
-        tatiller = get_resmi_tatiller(yil)
-
-        puantaj_res = []
-        genel_toplam_gun = 0
-
-        for _, row in df_st.iterrows():
-            satir = {
-                "SİCİL NO": row.get('sicil_no', ''),
-                "AD SOYAD": row['ad_soyad'],
-                "GEMİ": row['gemi'],
-                "BÖLÜM": row['bolum']
-            }
-            leaves = get_intern_leaves(row['id'])
-            kisi_toplam_gun = 0
-
-            for d in gunler_range:
-                d_str  = d.strftime('%Y-%m-%d')
-                gun_tr = TR_GUNLER[d.strftime('%A')]
-                is_tatil = (gun_tr in ["CUMARTESİ", "PAZAR"]) or (d_str in tatiller)
-
-                if is_tatil:
-                    satir[d.day] = "TATİL"
-                else:
-                    staj_gunu = (
-                        gun_tr in ["PAZARTESİ", "SALI", "ÇARŞAMBA"]
-                        if row['gun_grubu'] == "PAZARTESİ-SALI-ÇARŞAMBA"
-                        else gun_tr in ["ÇARŞAMBA", "PERŞEMBE", "CUMA"]
+                if non_work:
+                    top5 = ", ".join(non_work[:5])
+                    st.info(
+                        f"ℹ️ Aşağıdaki günler stajyerin çalışma periyoduna ({periyot}) dahil değil "
+                        f"ve izne sayılmayacak:\n**{top5}**"
+                        + ("…" if len(non_work) > 5 else "")
                     )
-                    izin_tipi = izin_var_mi(leaves, d_str)
+                try:
+                    add_izin({
+                        "stajyer_id":        intern_id,
+                        "baslangic_tarihi":  str(bas_tarih),
+                        "bitis_tarihi":      str(bit_tarih),
+                        "izin_turu":         izin_turu,
+                    })
+                    st.success(
+                        f"✅ İzin kaydedildi! "
+                        f"**{intern_row['ad']} {intern_row['soyad']}** — "
+                        f"{bas_tarih.strftime('%d.%m.%Y')} / {bit_tarih.strftime('%d.%m.%Y')} / {izin_turu}"
+                    )
+                    st.rerun()
+                except SQLAlchemyError as exc:
+                    st.error(f"❌ Kayıt hatası: {exc}")
 
-                    if izin_tipi:
-                        satir[d.day] = izin_tipi
-                    elif staj_gunu:
-                        satir[d.day] = "1"
-                        kisi_toplam_gun += 1
-                    else:
-                        satir[d.day] = "-"
+    # ─── İzin listesi ─────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("📌 Kayıtlı İzinler")
 
-            satir["KİŞİ TOPLAM"] = kisi_toplam_gun
-            genel_toplam_gun += kisi_toplam_gun
-            puantaj_res.append(satir)
+    try:
+        iz_df = get_all_izinler()
+    except SQLAlchemyError as exc:
+        st.error(f"İzinler yüklenemedi: {exc}")
+        return
 
-        p_df = pd.DataFrame(puantaj_res)
-        st.info(f"📊 **BU AY TÜM STAJYERLERİN TOPLAM STAJ GÜNÜ: {genel_toplam_gun} GÜN**")
-        st.dataframe(p_df, use_container_width=True)
+    if iz_df.empty:
+        st.info("Henüz kayıtlı izin yok.")
+        return
 
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            p_df.to_excel(writer, index=False, sheet_name='PUANTAJ')
-            workbook  = writer.book
-            worksheet = writer.sheets['PUANTAJ']
-            bold = workbook.add_format({'bold': True})
-            worksheet.write(len(p_df) + 2, 0, "TÜM ÖĞRENCİLER GENEL TOPLAM:", bold)
-            worksheet.write(len(p_df) + 2, 1, genel_toplam_gun, bold)
+    # Filtre
+    fil_gemi = st.selectbox(
+        "Gemi filtresi",
+        ["Tümü"] + sorted(iz_df["staj_gemisi"].dropna().unique().tolist()),
+    )
+    show_df = iz_df if fil_gemi == "Tümü" else iz_df[iz_df["staj_gemisi"] == fil_gemi]
 
-        st.download_button(
-            label="📥 EXCEL OLARAK İNDİR",
-            data=output.getvalue(),
-            file_name=f"PUANTAJ_{ay}_{yil}.xlsx"
-        )
+    col_labels = {
+        "id": "ID", "ad": "Ad", "soyad": "Soyad", "staj_gemisi": "Gemi",
+        "baslangic_tarihi": "Başlangıç", "bitis_tarihi": "Bitiş", "izin_turu": "Tür",
+    }
+    st.dataframe(show_df.rename(columns=col_labels), use_container_width=True, hide_index=True)
+
+    # Silme
+    with st.expander("🗑️ İzin Sil"):
+        if not iz_df.empty:
+            izin_opts = {
+                f"#{r['id']} | {r['ad']} {r['soyad']} | {r['baslangic_tarihi']} → {r['bitis_tarihi']}": r["id"]
+                for _, r in iz_df.iterrows()
+            }
+            sec_izin = st.selectbox("Silmek istenen izin", list(izin_opts.keys()))
+            if st.button("🗑️ İzni Sil", type="secondary"):
+                try:
+                    delete_izin(izin_opts[sec_izin])
+                    st.success("İzin kaydı silindi.")
+                    st.rerun()
+                except SQLAlchemyError as exc:
+                    st.error(f"Silme hatası: {exc}")
+
+
+# ══════════════════════════════════════════════════════
+#  SAYFA: PUANTAJ ÇIKTISI
+# ══════════════════════════════════════════════════════
+
+def page_puantaj():
+    st.title("📊 Puantaj Çıktısı")
+    st.caption("Aylık çalışma tablosunu görüntüleyin ve .xlsx olarak indirin.")
+
+    # ─── Filtre çubuğu ────────────────────────────────────────────────────────
+    pc1, pc2, pc3 = st.columns([1, 1, 2])
+    yil_secenekleri = list(range(2022, date.today().year + 3))
+    with pc1:
+        sec_yil = st.selectbox("Yıl", yil_secenekleri, index=yil_secenekleri.index(date.today().year))
+    with pc2:
+        sec_ay_adi = st.selectbox("Ay", AY_ADLARI, index=date.today().month - 1)
+        sec_ay     = AY_ADLARI.index(sec_ay_adi) + 1
+
+    try:
+        df = get_all_stajyerler()
+    except SQLAlchemyError as exc:
+        st.error(f"Veri yüklenemedi: {exc}")
+        return
+
+    with pc3:
+        gemiler    = ["Tümü"] + sorted(df["staj_gemisi"].dropna().unique().tolist()) if not df.empty else ["Tümü"]
+        sel_gemi_p = st.selectbox("Gemi Filtresi", gemiler)
+
+    if df.empty:
+        st.warning("Önce stajyer kaydı yapınız.")
+        return
+
+    if sel_gemi_p != "Tümü":
+        df = df[df["staj_gemisi"] == sel_gemi_p]
+
+    if df.empty:
+        st.info("Seçilen gemi için stajyer bulunamadı.")
+        return
+
+    tr_hols  = get_tr_holidays(sec_yil)
+    num_days = calendar.monthrange(sec_yil, sec_ay)[1]
+
+    # ─── Tatil bilgisi ────────────────────────────────────────────────────────
+    month_hols = {d: n for d, n in tr_hols.items() if d.year == sec_yil and d.month == sec_ay}
+    if month_hols:
+        hol_txt = "  ·  ".join(f"**{d.strftime('%d')}** {n}" for d, n in sorted(month_hols.items()))
+        st.info(f"🎌 Resmi tatiller: {hol_txt}")
     else:
-        st.warning("SİSTEMDE KAYITLI STAJYER BULUNAMADI.")
+        st.caption("Bu ayda resmi tatil yok.")
 
+    # ─── Ekran tablosu ────────────────────────────────────────────────────────
+    st.subheader(f"📅 {sec_ay_adi} {sec_yil} — Puantaj")
 
-# =============================================================
-# 5. KİŞİ BAZLI DEVAM RAPORU
-# =============================================================
-elif menu == "👁️ KİŞİ BAZLI DEVAM RAPORU":
-    st.header("👁️ KİŞİ BAZLI DEVAM RAPORU")
-    df_all = get_all_interns()
+    rows = []
+    for _, intern in df.iterrows():
+        izinler_df = get_izinler_for_month(intern["id"], sec_yil, sec_ay)
+        row = {
+            "Ad Soyad": f"{intern['ad']} {intern['soyad']}",
+            "Gemi":     intern["staj_gemisi"],
+            "Bölüm":    intern["bolum"],
+        }
+        total = 0
+        for d in range(1, num_days + 1):
+            day_date = date(sec_yil, sec_ay, d)
+            status   = get_day_status(day_date, intern["calisma_periyodu"], izinler_df, tr_hols)
+            col_key  = f"{d}"
+            match status:
+                case "HAFTA SONU":           row[col_key] = "〇"
+                case "TATİL":                row[col_key] = "🎌"
+                case "-":                    row[col_key] = ""
+                case "1":                    row[col_key] = "✅"; total += 1
+                case "RAPORLU":              row[col_key] = "📋"
+                case "RAPORSUZ DEVAMSIZLIK": row[col_key] = "❌"
+                case _:                      row[col_key] = ""
+        row["Toplam"] = total
+        rows.append(row)
 
-    if df_all.empty:
-        st.warning("SİSTEMDE KAYITLI STAJYER BULUNAMADI.")
-    else:
-        col_f1, col_f2, col_f3 = st.columns([2, 1, 1])
-        with col_f1:
-            secim = st.selectbox("STAJYER SEÇİN (VEYA TÜMÜ)", ["— TÜMÜ —"] + df_all['ad_soyad'].tolist())
-        with col_f2:
-            r_bas = st.date_input("BAŞLANGIÇ", datetime(datetime.now().year, 1, 1).date(), key="r_bas")
-        with col_f3:
-            r_bit = st.date_input("BİTİŞ", datetime.now().date(), key="r_bit")
+    result_df = pd.DataFrame(rows)
+    st.dataframe(result_df, use_container_width=True, hide_index=True)
+    st.caption(
+        "**Lejant:** ✅ Çalışma günü  ·  🎌 Resmi tatil  ·  〇 Hafta sonu  ·  "
+        "📋 Raporlu izin  ·  ❌ Raporsuz devamsızlık  ·  Boş → Periyot dışı gün"
+    )
 
-        if r_bit < r_bas:
-            st.error("BİTİŞ TARİHİ BAŞLANGIÇTAN ÖNCE OLAMAZ!")
-            st.stop()
+    # ─── Excel indirme ────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("⬇️ Excel İndir")
 
-        tatiller = get_resmi_tatiller(r_bas.year)
-        if r_bas.year != r_bit.year:
-            tatiller += get_resmi_tatiller(r_bit.year)
-
-        filtre_df = df_all if secim == "— TÜMÜ —" else df_all[df_all['ad_soyad'] == secim]
-        istat_listesi = []
-        for _, row in filtre_df.iterrows():
-            ist = stajyer_istatistik(row, r_bas, r_bit, tatiller)
-            ist["AD SOYAD"] = row['ad_soyad']
-            ist["GEMİ"]    = row['gemi']
-            ist["BÖLÜM"]   = row['bolum']
-            ist["SİCİL"]   = row.get('sicil_no', '')
-            istat_listesi.append(ist)
-
-        if secim != "— TÜMÜ —" and len(istat_listesi) == 1:
-            ist = istat_listesi[0]
-            st.subheader(f"📋 {secim} — DETAY RAPOR")
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("TOPLAM STAJ GÜNÜ",    ist["toplam_staj_gunu"])
-            m2.metric("DEVAM GÜNÜ",          ist["devam_gunu"])
-            m3.metric("RAPORLU",             ist["raporlu_gun"])
-            m4.metric("RAPORSUZ DEVAMSIZLIK",ist["raporsuz_gun"])
-            m5.metric("DEVAM ORANI",         f"%{ist['devam_orani']}")
-
-            st.progress(int(ist["devam_orani"]))
-
-            izinler_kisi = get_intern_leaves(int(df_all[df_all['ad_soyad'] == secim]['id'].values[0]))
-            if not izinler_kisi.empty:
-                st.subheader("📅 İZİN GEÇMİŞİ")
-                izinler_kisi['SÜRE (GÜN)'] = (
-                    pd.to_datetime(izinler_kisi['izin_bitis']) -
-                    pd.to_datetime(izinler_kisi['izin_baslangic'])
-                ).dt.days + 1
-                st.dataframe(izinler_kisi[['izin_baslangic','izin_bitis','izin_tipi','SÜRE (GÜN)']].rename(columns={
-                    'izin_baslangic': 'BAŞLANGIÇ',
-                    'izin_bitis': 'BİTİŞ',
-                    'izin_tipi': 'TİP'
-                }), use_container_width=True, hide_index=True)
-        else:
-            istat_df = pd.DataFrame(istat_listesi)[[
-                "SİCİL","AD SOYAD","GEMİ","BÖLÜM",
-                "toplam_staj_gunu","devam_gunu","raporlu_gun","raporsuz_gun","devam_orani"
-            ]].rename(columns={
-                "toplam_staj_gunu": "TOPLAM GÜN",
-                "devam_gunu":       "DEVAM",
-                "raporlu_gun":      "RAPORLU",
-                "raporsuz_gun":     "RAPORSUZ",
-                "devam_orani":      "DEVAM %",
-            })
-
-            # FIX: background_gradient (matplotlib gerektirir) kaldırıldı
-            # Devam oranını görsel olarak ifade etmek için Plotly kullanılıyor
-            st.dataframe(istat_df, use_container_width=True, hide_index=True)
-
-            # Devam % renk göstergesi ayrı bir bar chart ile
-            fig_oran_tablo = px.bar(
-                istat_df.sort_values("DEVAM %", ascending=False),
-                x="AD SOYAD", y="DEVAM %",
-                title="📊 DEVAM ORANLARI — RENK SKALASI",
-                color="DEVAM %",
-                color_continuous_scale="RdYlGn",
-                range_color=[0, 100],
-                text="DEVAM %"
+    with st.spinner("Excel hazırlanıyor…"):
+        try:
+            excel_buf = create_excel(sec_yil, sec_ay, df)
+            st.download_button(
+                label=f"📥  {sec_ay_adi} {sec_yil} Puantaj (.xlsx)",
+                data=excel_buf,
+                file_name=f"Puantaj_{sec_yil}_{sec_ay:02d}_{sel_gemi_p.replace(' ', '_')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                type="primary",
             )
-            fig_oran_tablo.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
-            fig_oran_tablo.add_hline(y=80, line_dash="dash", line_color="navy",
-                                     annotation_text="80% EŞİĞİ")
-            st.plotly_chart(fig_oran_tablo, use_container_width=True)
+        except Exception as exc:
+            st.error(f"Excel oluşturulamadı: {exc}")
 
-            col_g1, col_g2 = st.columns(2)
-            with col_g1:
-                fig_bar = px.bar(
-                    istat_df, x="AD SOYAD", y=["DEVAM","RAPORLU","RAPORSUZ"],
-                    title="📊 KİŞİ BAZLI DEVAM KARŞILAŞTIRMASI",
-                    barmode="stack", color_discrete_map={
-                        "DEVAM": "#2ecc71", "RAPORLU": "#f39c12", "RAPORSUZ": "#e74c3c"
-                    }
-                )
-                st.plotly_chart(fig_bar, use_container_width=True)
-            with col_g2:
-                fig_oran = px.bar(
-                    istat_df.sort_values("DEVAM %"),
-                    x="DEVAM %", y="AD SOYAD",
-                    orientation='h',
-                    title="📈 DEVAM ORANLARI (%)",
-                    color="DEVAM %",
-                    color_continuous_scale="RdYlGn",
-                    range_color=[0, 100]
-                )
-                fig_oran.add_vline(x=80, line_dash="dash", line_color="navy",
-                                   annotation_text="80% EŞİĞİ")
-                st.plotly_chart(fig_oran, use_container_width=True)
 
-            out2 = io.BytesIO()
-            with pd.ExcelWriter(out2, engine='xlsxwriter') as writer:
-                istat_df.to_excel(writer, index=False, sheet_name='DEVAM_RAPORU')
-            st.download_button("📥 RAPORU EXCEL OLARAK İNDİR",
-                               data=out2.getvalue(),
-                               file_name=f"DEVAM_RAPORU_{r_bas}_{r_bit}.xlsx")
+# ══════════════════════════════════════════════════════
+#  SIDEBAR & YÖNLENDIRME
+# ══════════════════════════════════════════════════════
 
-# =============================================================
-# 6. GELİŞMİŞ FİLTRELEME
-# =============================================================
-elif menu == "🔍 GELİŞMİŞ FİLTRELEME":
-    st.header("🔍 GELİŞMİŞ FİLTRELEME VE ARAMA")
-    df_all = get_all_interns()
+PAGES = {
+    "📋 Stajyer Kayıt":  page_kayit,
+    "🚢 Gemi Dashboard": page_dashboard,
+    "📅 İzin Girişi":    page_izin,
+    "📊 Puantaj Çıktısı": page_puantaj,
+}
 
-    if df_all.empty:
-        st.warning("SİSTEMDE KAYITLI STAJYER BULUNAMADI.")
-    else:
-        with st.expander("🎛️ FİLTRELER", expanded=True):
-            fc1, fc2, fc3, fc4 = st.columns(4)
-            with fc1:
-                gemiler     = ["TÜMÜ"] + sorted(df_all['gemi'].dropna().unique().tolist())
-                f_gemi      = st.selectbox("GEMİ", gemiler)
-            with fc2:
-                bolumler    = ["TÜMÜ"] + sorted(df_all['bolum'].dropna().unique().tolist())
-                f_bolum     = st.selectbox("BÖLÜM", bolumler)
-            with fc3:
-                gun_gruplari = ["TÜMÜ"] + sorted(df_all['gun_grubu'].dropna().unique().tolist())
-                f_gun_grubu  = st.selectbox("GÜN GRUBU", gun_gruplari)
-            with fc4:
-                f_ad = st.text_input("AD SOYAD ARA")
 
-        bugun = datetime.now().date()
-        df_all['baslangic'] = pd.to_datetime(df_all['baslangic']).dt.date
-        df_all['bitis']     = pd.to_datetime(df_all['bitis']).dt.date
-        df_all['DURUM'] = df_all['bitis'].apply(
-            lambda b: "✅ AKTİF" if pd.notna(b) and b >= bugun else "⏹️ TAMAMLANDI"
-        )
+def main():
+    # CSS ince dokunuş
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebarNav"] { display: none; }
+        .stMetric { background: #f0f4f8; border-radius: 8px; padding: 8px; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
-        sonuc = df_all.copy()
-        if f_gemi     != "TÜMÜ":   sonuc = sonuc[sonuc['gemi']     == f_gemi]
-        if f_bolum    != "TÜMÜ":   sonuc = sonuc[sonuc['bolum']    == f_bolum]
-        if f_gun_grubu!= "TÜMÜ":   sonuc = sonuc[sonuc['gun_grubu']== f_gun_grubu]
-        if f_ad.strip():           sonuc = sonuc[sonuc['ad_soyad'].str.contains(f_ad.upper(), na=False)]
+    init_db()
 
-        sm1, sm2, sm3, sm4 = st.columns(4)
-        sm1.metric("SONUÇ SAYISI",    len(sonuc))
-        sm2.metric("AKTİF",          len(sonuc[sonuc['DURUM'] == "✅ AKTİF"]))
-        sm3.metric("TAMAMLANDI",     len(sonuc[sonuc['DURUM'] == "⏹️ TAMAMLANDI"]))
-        aktif_gemiler = sonuc['gemi'].nunique()
-        sm4.metric("GEMİ SAYISI",    aktif_gemiler)
+    st.sidebar.image(
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3d/Anchor_pictogram.svg/240px-Anchor_pictogram.svg.png",
+        width=60,
+    )
+    st.sidebar.title("Stajyer Takip\nSistemi")
+    st.sidebar.divider()
 
-        st.divider()
+    sel = st.sidebar.radio("Sayfa Seçin", list(PAGES.keys()), label_visibility="collapsed")
+    st.sidebar.divider()
 
-        if sonuc.empty:
-            st.info("FİLTREYE UYAN KAYIT BULUNAMADI.")
-        else:
-            goster_kolonlar = ['sicil_no','ad_soyad','okul','gemi','bolum',
-                               'telefon','baslangic','bitis','gun_grubu','DURUM','notlar']
-            goster_kolonlar = [k for k in goster_kolonlar if k in sonuc.columns]
-            st.dataframe(
-                sonuc[goster_kolonlar].rename(columns={
-                    'sicil_no':'SİCİL', 'ad_soyad':'AD SOYAD', 'okul':'OKUL',
-                    'gemi':'GEMİ', 'bolum':'BÖLÜM', 'telefon':'TELEFON',
-                    'baslangic':'BAŞLANGIÇ', 'bitis':'BİTİŞ',
-                    'gun_grubu':'GÜN GRUBU', 'notlar':'NOTLAR'
-                }),
-                use_container_width=True, hide_index=True
-            )
+    # Mini istatistik
+    try:
+        df_all = get_all_stajyerler()
+        st.sidebar.metric("Toplam Stajyer", len(df_all))
+        if not df_all.empty:
+            st.sidebar.metric("Aktif Gemi",   df_all["staj_gemisi"].nunique())
+    except Exception:
+        pass
 
-            col_g1, col_g2 = st.columns(2)
-            with col_g1:
-                gemi_dag = sonuc['gemi'].value_counts().reset_index()
-                gemi_dag.columns = ['GEMİ','SAYI']
-                st.plotly_chart(
-                    px.bar(gemi_dag, x='GEMİ', y='SAYI',
-                           title="🚢 SONUÇLARDA GEMİ DAĞILIMI",
-                           color='SAYI', color_continuous_scale='Blues'),
-                    use_container_width=True
-                )
-            with col_g2:
-                durum_dag = sonuc['DURUM'].value_counts().reset_index()
-                durum_dag.columns = ['DURUM','SAYI']
-                st.plotly_chart(
-                    px.pie(durum_dag, values='SAYI', names='DURUM',
-                           title="📊 AKTİF / TAMAMLANDI",
-                           color_discrete_map={"✅ AKTİF":"#2ecc71","⏹️ TAMAMLANDI":"#bdc3c7"},
-                           hole=0.4),
-                    use_container_width=True
-                )
+    st.sidebar.divider()
+    st.sidebar.caption("🚢 v1.0 | Stajyer Takip")
 
-            out3 = io.BytesIO()
-            with pd.ExcelWriter(out3, engine='xlsxwriter') as writer:
-                sonuc[goster_kolonlar].to_excel(writer, index=False, sheet_name='FİLTRELİ_LİSTE')
-            st.download_button("📥 FİLTRELİ LİSTEYİ EXCEL OLARAK İNDİR",
-                               data=out3.getvalue(),
-                               file_name="FILTRELI_LISTE.xlsx")
+    PAGES[sel]()
+
+
+if __name__ == "__main__":
+    main()
