@@ -1,5 +1,6 @@
 streamlit
+sqlalchemy
 pandas
-xlsxwriter
 openpyxl
-plotly
+holidays
+psycopg2-binary
